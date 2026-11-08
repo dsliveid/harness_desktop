@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use hd_core::security::guard::Policy;
 use hd_protocol::CURRENT_PROTOCOL_VERSION;
 
-use crate::daemon::RuntimeStats;
+use crate::daemon::{Daemon, RuntimeStats};
 use crate::vault::{DeviceToken, TokenVault, VaultError};
 
 /// 宿主壳版本（`Cargo.toml` 的 version，编译期写入）。
@@ -99,6 +99,14 @@ const PAIR_CODE_MAX_LEN: usize = 12;
 pub struct HostState {
     vault: Arc<dyn TokenVault>,
     stats: Arc<RuntimeStats>,
+    /// 🔴 全局唯一的 Runner 守护实例。
+    ///
+    /// **必须共享**：启动编排（`gui.rs` setup）与配对（`start_pairing_real`）
+    /// 都要拉起 Runner。若各自 `Daemon::new()`，两个实例的 `is_running()` 互相
+    /// 不可见 —— 配对流程会以「没在跑」再 spawn 一次，结果同一设备开出两条
+    /// WS 连接，服务端给旧连接发 `device.replaced` 并断开，用户看到「配对成功
+    /// 却立刻掉线」。这是真实发生过的缺陷，故把实例挂进 State 强制共用。
+    daemon: Arc<Daemon>,
     /// 工作区根（已归一的展示形态）。
     roots: RwLock<Vec<PathBuf>>,
     /// 当前守卫策略（`Arc<Policy>` 便于整体替换而不是逐字段改）。
@@ -129,6 +137,9 @@ impl HostState {
         Self {
             vault,
             stats,
+            // 默认建一个实例：单测与旧调用方无需改动。
+            // 生产路径（gui.rs）会用 `with_daemon` 注入同一个实例。
+            daemon: Arc::new(Daemon::new(hd_runner::reconnect::ReconnectPolicy::default())),
             roots: RwLock::new(Vec::new()),
             policy: RwLock::new(Arc::new(Policy::new(Vec::new(), Vec::new()))),
             device_id: RwLock::new(None),
@@ -155,6 +166,11 @@ impl HostState {
     /// 读取密钥链中的令牌（🔴 仅供宿主内部拉 Runner 使用，绝不经 command 返回）。
     pub fn vault_ref(&self) -> Arc<dyn TokenVault> {
         Arc::clone(&self.vault)
+    }
+
+    /// 共享的 Runner 守护实例（🔴 全局唯一，见字段注释）。
+    pub fn daemon(&self) -> Arc<Daemon> {
+        Arc::clone(&self.daemon)
     }
 
     /// 当前守卫策略快照（daemon 热更新时用）。
@@ -447,12 +463,13 @@ pub async fn start_pairing_real(
         })?;
 
     // ③ 落令牌 + 写档案 + 拉起 Runner（复用已 e2e 验证的 Bootstrap）。
-    let daemon = std::sync::Arc::new(crate::daemon::Daemon::new(
-        hd_runner::reconnect::ReconnectPolicy::default(),
-    ));
+    //
+    // 🔴 必须用 `state.daemon()` 而不是新建：与启动编排共用同一个实例，
+    // 否则它的 `is_running()` 看不到 setup 已拉起的 Runner，会重复 spawn
+    // 造成同设备两条 WS（服务端 replaced 互踢，表现为「配对成功却立刻掉线」）。
     let boot = crate::bootstrap::Bootstrap::new(
         state.vault_ref(),
-        daemon,
+        state.daemon(),
         "hd-runner",
         paired.protocol_version,
     )
@@ -496,6 +513,22 @@ mod tests {
         let vault = Arc::new(MemoryVault::new());
         let stats = Arc::new(RuntimeStats::default());
         HostState::new(vault, stats)
+    }
+
+    /// 🔴 防回归：`daemon()` 多次调用必须返回**同一个**实例。
+    ///
+    /// 这条守的是一个真实发生过的缺陷：启动编排与配对流程曾各自
+    /// `Daemon::new()`，导致 is_running() 互不可见 → 重复 spawn →
+    /// 同设备两条 WS → 服务端 replaced 互踢（用户看到「配对成功却立刻掉线」）。
+    #[test]
+    fn daemon_is_shared_across_callers() {
+        let st = state();
+        let a = st.daemon();
+        let b = st.daemon();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "daemon() 返回了不同实例：会让启动编排与配对流程互相看不见运行状态"
+        );
     }
 
     fn paired_state() -> HostState {

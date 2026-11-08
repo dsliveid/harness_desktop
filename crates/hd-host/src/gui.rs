@@ -160,12 +160,12 @@ pub fn run() -> tauri::Result<()> {
                 };
 
                 // 复用上一轮已 e2e 验证的 Bootstrap；Runner 可执行文件名按平台约定。
-                let daemon = std::sync::Arc::new(crate::daemon::Daemon::new(
-                    hd_runner::reconnect::ReconnectPolicy::default(),
-                ));
+                //
+                // 🔴 用 `state.daemon()` 而非新建：与 `pair_device` 共用同一实例，
+                // 让两处的 is_running() 互相可见，避免重复 spawn。
                 let boot = crate::bootstrap::Bootstrap::new(
                     state.vault_ref(),
-                    daemon,
+                    state.daemon(),
                     "hd-runner",
                     hd_protocol::CURRENT_PROTOCOL_VERSION,
                 )

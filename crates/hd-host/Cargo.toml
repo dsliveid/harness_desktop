@@ -75,10 +75,18 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 
 # GUI 入口需要 feature gui，默认不编译（原因见 src/lib.rs 顶部）。
-# 刻意不设 build.rs / [build-dependencies]：tauri-build 的 build script 会**无条件**执行，
-# 那样默认（无 gui）构建也会跑一遍 GUI 工具链，破坏「纯逻辑层零 GUI 依赖」的分层。
-# 本轮不打包 installer，因此 `tauri::generate_context!()` 直接读 tauri.conf.json 即可。
 [[bin]]
 name = "hd-host"
 path = "src/main.rs"
 required-features = ["gui"]
+
+# 🔴 build.rs 是**必需**的，用来在 gui 构建时编入 Windows manifest。
+#
+# 曾经这里写着「刻意不设 build.rs，避免无条件跑 GUI 工具链」——那是错的取舍：
+# 没有 manifest，Tauri 用到的 TaskDialogIndirect（Common-Controls v6 专有）
+# 在运行时定位不到，exe 一启动就弹「无法找到入口」错误框。
+#
+# 现在改为：build.rs 存在，但其内容按 `cfg(feature = "gui")` 门控 ——
+# 纯逻辑构建（cargo test）下它什么也不做，既保留分层，又保证 GUI 可运行。
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
