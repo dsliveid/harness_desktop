@@ -45,6 +45,9 @@ crates/hd-host/ui/*
 # ---------- 5. 临时文件与操作系统垃圾 ----------
 *.log
 *.tmp
+# 构建脚本的 stderr 重定向产物（如 rel_host.err、tauri_build.err）——
+# 曾因漏了这条而把 4 个 .err 文件误提交，事后才清理。
+*.err
 # agent / 构建脚本产生的临时输出（如 tmp_out.txt、tmp_err.txt）
 tmp_*.txt
 .DS_Store
