@@ -11,6 +11,7 @@
 //! 这个划分让「心跳间隔必须来自 welcome」这类约束能被钉死在单测里，
 //! 而不是靠代码评审记忆。
 
+pub mod cli;
 pub mod heartbeat;
 pub mod idempot;
 pub mod ipc;
@@ -20,6 +21,7 @@ pub mod router;
 pub mod supervisor;
 pub mod transport;
 
+pub use cli::{run_cli, EXIT_NO_AUTH};
 pub use heartbeat::HeartbeatPolicy;
 pub use idempot::{
     ClaimGuard, ClaimResult, Clock, IdempotStore, SystemClock, DEFAULT_CAPACITY, DEFAULT_TTL,

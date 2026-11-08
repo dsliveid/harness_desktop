@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hd_host::daemon::{build_reload_policy_line, Daemon, DaemonError, RunnerState};
+use hd_host::daemon::{build_reload_policy_line, Daemon, DaemonError, RunnerLaunch, RunnerState};
 use hd_host::vault::{DeviceToken, MemoryVault, TokenVault};
 use hd_runner::reconnect::ReconnectPolicy;
 
@@ -51,7 +51,7 @@ async fn wait_until<F: FnMut() -> bool>(mut cond: F) -> bool {
 async fn auth_line_actually_reaches_child_stdin() {
     let d = daemon();
     d.spawn(
-        &fake_runner_exe(),
+        &RunnerLaunch::standalone(fake_runner_exe()),
         &token("hgd_integration_token_abc"),
         "wss://example.test/api/v1/devices/ws",
         1,
@@ -97,9 +97,14 @@ async fn auth_line_actually_reaches_child_stdin() {
 #[tokio::test]
 async fn child_stays_alive_until_stdin_closes_then_self_terminates() {
     let d = daemon();
-    d.spawn(&fake_runner_exe(), &token("hgd_keepalive"), "wss://x", 1)
-        .await
-        .expect("应能拉起假 Runner");
+    d.spawn(
+        &RunnerLaunch::standalone(fake_runner_exe()),
+        &token("hgd_keepalive"),
+        "wss://x",
+        1,
+    )
+    .await
+    .expect("应能拉起假 Runner");
 
     // 等 auth 回显，确认子进程已进入读循环。
     let d_ref = &d;
@@ -150,9 +155,14 @@ async fn dropping_host_releases_stdin_and_child_exits() {
     let exe = fake_runner_exe();
     {
         let d = daemon();
-        d.spawn(&exe, &token("hgd_crashcase"), "wss://x", 1)
-            .await
-            .expect("应能拉起假 Runner");
+        d.spawn(
+            &RunnerLaunch::standalone(exe),
+            &token("hgd_crashcase"),
+            "wss://x",
+            1,
+        )
+        .await
+        .expect("应能拉起假 Runner");
         let d_ref = &d;
         let started =
             wait_until(|| d_ref.logs().iter().any(|l| l.contains("auth token_len="))).await;
@@ -178,9 +188,14 @@ async fn auth_line_is_not_in_argv_and_not_in_env() {
     assert!(!line.contains('='), "auth 行不应是 KEY=VALUE 形态：{line}");
 
     let d = daemon();
-    d.spawn(&fake_runner_exe(), &token("hgd_env_canary"), "wss://x", 1)
-        .await
-        .expect("应能拉起假 Runner");
+    d.spawn(
+        &RunnerLaunch::standalone(fake_runner_exe()),
+        &token("hgd_env_canary"),
+        "wss://x",
+        1,
+    )
+    .await
+    .expect("应能拉起假 Runner");
     let d_ref = &d;
     let _ = wait_until(|| d_ref.logs().iter().any(|l| l.contains("auth token_len="))).await;
     for l in d.logs() {
@@ -193,7 +208,12 @@ async fn auth_line_is_not_in_argv_and_not_in_env() {
 async fn spawn_rejects_empty_token_and_keeps_state_stopped() {
     let d = daemon();
     let err = d
-        .spawn(&fake_runner_exe(), &token(""), "wss://x", 1)
+        .spawn(
+            &RunnerLaunch::standalone(fake_runner_exe()),
+            &token(""),
+            "wss://x",
+            1,
+        )
         .await
         .expect_err("空令牌必须拒绝");
     assert!(matches!(err, DaemonError::Token(_)));
@@ -215,9 +235,14 @@ async fn vault_to_daemon_happy_path() {
     vault.set(&token("hgd_e2e_token_123456")).expect("写入令牌");
     let tok = vault.get().expect("读 vault").expect("应已配对");
 
-    d.spawn(&fake_runner_exe(), &tok, "wss://example.test/ws", 1)
-        .await
-        .expect("拉起 Runner");
+    d.spawn(
+        &RunnerLaunch::standalone(fake_runner_exe()),
+        &tok,
+        "wss://example.test/ws",
+        1,
+    )
+    .await
+    .expect("拉起 Runner");
 
     let d_ref = &d;
     let ok = wait_until(|| {
@@ -239,9 +264,14 @@ async fn vault_to_daemon_happy_path() {
 #[tokio::test]
 async fn wait_exit_records_exit_code() {
     let d = daemon();
-    d.spawn(&fake_runner_exe(), &token("hgd_exitcode"), "wss://x", 1)
-        .await
-        .expect("拉起 Runner");
+    d.spawn(
+        &RunnerLaunch::standalone(fake_runner_exe()),
+        &token("hgd_exitcode"),
+        "wss://x",
+        1,
+    )
+    .await
+    .expect("拉起 Runner");
 
     let d_ref = &d;
     let started = wait_until(|| d_ref.logs().iter().any(|l| l.contains("auth token_len="))).await;

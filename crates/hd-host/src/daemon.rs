@@ -309,41 +309,90 @@ pub fn build_reload_policy_line(roots: &[String], exec_allowlist: &[String]) -> 
     value.to_string()
 }
 
+/// Runner 启动方式：可执行文件 + 需要附加的参数。
+///
+/// 单文件交付（默认）下 `exe` 就是宿主自身，`extra_args` 为 `["--runner"]`；
+/// 用户自编译独立 runner 时 `extra_args` 为空。把「用哪个文件」和「带什么参数」
+/// 放在同一个结构里返回，是为了让调用方**不可能**只改其一 —— 只传 exe 不传
+/// `--runner` 会让 GUI 再弹一个窗口（自派生只在带参数时才走 Runner 分支）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerLaunch {
+    /// 要执行的程序路径。
+    pub exe: PathBuf,
+    /// 附加参数（自派生时为 `["--runner"]`，独立 runner 时为空）。
+    pub extra_args: Vec<String>,
+}
+
+impl RunnerLaunch {
+    /// 以宿主自身自派生 Runner。
+    pub fn self_derived(exe: PathBuf) -> Self {
+        Self {
+            exe,
+            extra_args: vec![SELF_DERIVE_FLAG.to_string()],
+        }
+    }
+
+    /// 用独立的 runner 可执行文件启动。
+    pub fn standalone(exe: PathBuf) -> Self {
+        Self {
+            exe,
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+/// 自派生开关（与 `main.rs` 的 `is_runner_mode` 必须完全一致）。
+pub const SELF_DERIVE_FLAG: &str = "--runner";
+
 /// Runner 定位器。
 ///
-/// 按顺序尝试：显式配置 → 同目录（打包后 runner 与 host 并排）→ 开发期 `target/<profile>`。
-/// 每一步都有注释说明为什么这样排：打包形态与开发形态的目录布局不同，
-/// 只写死一种会导致另一种场景「运行时才报找不到」。
-pub fn locate_runner(explicit: Option<&Path>, exe_name: &str) -> Option<PathBuf> {
+/// 优先级刻意如此排列，理由各自不同：
+///
+/// ⓪ **自派生**（仅当显式 `allow_self=true`）：宿主自身 + `--runner`。
+///    ⚠️ **Windows 上实测不可用**：链接了 Tauri 的 exe 由父进程经
+///    `Stdio::piped()` 拉起时，会在加载期以 `0xC0000139` 崩溃（stderr 为空，
+///    从未进入 `main()`）；而独立的 hd-runner.exe 走同一条 spawn 路径完全正常。
+///    这是 Tauri 加载期初始化与管道子进程上下文的冲突，不是我们的逻辑缺陷。
+///    因此**默认 `allow_self=false`**，该分支仅保留给非 Windows 平台或未来
+///    改用动态加载 Tauri 后再启用。
+/// ① **显式配置**：允许用户指定自编译的 runner（企业定制/调试）。
+/// ② **同目录独立 runner**：默认路径。既支持单目录分发（两个文件放一起，
+///    用户只点 hd-host.exe），也保留 headless 部署与 `device-e2e` 拉真二进制的
+///    能力。
+pub fn locate_runner(
+    explicit: Option<&Path>,
+    exe_name: &str,
+    allow_self: bool,
+) -> Option<RunnerLaunch> {
+    let current = std::env::current_exe().ok();
+
+    // ⓪ 自派生：宿主自己就是 Runner（见上文关于 Windows 限制的说明）。
+    if allow_self {
+        if let Some(me) = current.as_ref() {
+            if me.is_file() {
+                return Some(RunnerLaunch::self_derived(me.clone()));
+            }
+        }
+    }
+
     // ① 显式配置优先（允许用户指定自编译的 runner）。
     if let Some(p) = explicit {
         if p.is_file() {
-            return Some(p.to_path_buf());
+            return Some(RunnerLaunch::standalone(p.to_path_buf()));
         }
     }
 
     // ② 与宿主可执行文件同目录：安装包会这样布局（§18 打包约定）。
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(dir) = current.parent() {
+    if let Some(me) = current.as_ref() {
+        if let Some(dir) = me.parent() {
             let candidate = dir.join(exe_name);
             if candidate.is_file() {
-                return Some(candidate);
+                return Some(RunnerLaunch::standalone(candidate));
             }
             // 打包时 runner 常放在 `resources/` 子目录。
             let candidate = dir.join("resources").join(exe_name);
             if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // ③ 开发期：`cargo run -p hd-host` 的产物在 target/<profile>/hd-host(.exe)，
-    //    runner 在同一目录里命名不同，因此取同目录 + exe_name。
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(dir) = current.parent() {
-            let candidate = dir.join(exe_name);
-            if candidate.is_file() {
-                return Some(candidate);
+                return Some(RunnerLaunch::standalone(candidate));
             }
         }
     }
@@ -434,7 +483,7 @@ impl Daemon {
     /// 把它拼进 `argv` —— 本函数签名里没有接收「字符串形式的令牌」的通道。
     pub async fn spawn(
         &self,
-        exe: &Path,
+        launch: &RunnerLaunch,
         token: &DeviceToken,
         ws_url: &str,
         protocol_version: i32,
@@ -442,18 +491,27 @@ impl Daemon {
         if token.is_empty() {
             return Err(DaemonError::Token("令牌为空，拒绝启动 Runner".to_string()));
         }
+        let exe = &launch.exe;
         if !exe.is_file() {
             return Err(DaemonError::RunnerNotFound(exe.display().to_string()));
         }
 
         self.stats.set_state(RunnerState::Running);
-        self.push_log(format!("[host] 启动 Runner：{}", exe.display()));
+        self.push_log(format!(
+            "[host] 启动 Runner：{} {}",
+            exe.display(),
+            launch.extra_args.join(" ")
+        ));
 
         // 🔴 关键：刻意**不**调用 `.arg(token)` / `.env("HD_TOKEN", token)`。
         // 见模块文档第 1 条。这里连 `.env_clear()` 都做了加码：
         // 清掉继承来的环境变量，防止某个上游变量里恰好带着旧令牌。
+        //
+        // `extra_args` 只可能是 `--runner` 这类开关（由 `RunnerLaunch` 构造时写死），
+        // 不存在拼接用户输入或令牌的路径。
         let mut cmd = Command::new(exe);
-        cmd.stdin(Stdio::piped())
+        cmd.args(&launch.extra_args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
@@ -749,7 +807,12 @@ mod tests {
     async fn spawn_rejects_empty_token() {
         let d = Daemon::new(ReconnectPolicy::default());
         let err = d
-            .spawn(Path::new("whatever"), &token(""), "wss://x", 1)
+            .spawn(
+                &RunnerLaunch::standalone("whatever".into()),
+                &token(""),
+                "wss://x",
+                1,
+            )
             .await
             .expect_err("空令牌必须拒绝");
         assert!(matches!(err, DaemonError::Token(_)), "实际：{err:?}");
@@ -763,7 +826,12 @@ mod tests {
         let d = Daemon::new(ReconnectPolicy::default());
         let missing = Path::new("definitely-not-a-real-runner-xyz");
         let err = d
-            .spawn(missing, &token("hgd_x"), "wss://x", 1)
+            .spawn(
+                &RunnerLaunch::standalone(missing.to_path_buf()),
+                &token("hgd_x"),
+                "wss://x",
+                1,
+            )
             .await
             .expect_err("不存在的 exe 必须拒绝");
         assert!(
@@ -842,18 +910,43 @@ mod tests {
         let fake = dir.path().join(format!("hd-runner{}", exe_suffix()));
         std::fs::write(&fake, b"").unwrap();
 
-        let found = locate_runner(Some(&fake), "hd-runner").expect("应命中显式路径");
-        assert_eq!(found, fake);
+        // allow_self=false：模拟「用户显式指定了独立 runner」的调试场景
+        let found = locate_runner(Some(&fake), "hd-runner", false).expect("应命中显式路径");
+        assert_eq!(found.exe, fake);
+        // 独立 runner 不需要附加参数
+        assert!(found.extra_args.is_empty());
     }
 
     #[test]
     fn locate_runner_returns_none_when_explicit_missing_and_no_sibling() {
         // 显式路径不存在 + 同目录没有该名字的文件 → None（而不是 panic）。
         let missing = Path::new("no-such-dir-xyz/no-such-runner");
-        let found = locate_runner(Some(missing), "definitely-absent-runner-name");
+        let found = locate_runner(Some(missing), "definitely-absent-runner-name", false);
         // 允许为 None；关键是「不 panic 且不返回不存在的路径」。
-        if let Some(p) = found {
-            assert!(p.is_file());
+        if let Some(launch) = found {
+            assert!(launch.exe.is_file());
+        }
+    }
+
+    /// 🔴 单文件交付的核心保证：allow_self=true 时必须返回宿主自身 + `--runner`。
+    ///
+    /// 这条一旦回归，用户双击 exe 会看到**第二个 GUI 窗口**而不是 Runner ——
+    /// 现象诡异且极难关联到「少传了一个参数」，所以必须由测试钉住。
+    #[test]
+    fn locate_runner_self_derives_with_runner_flag() {
+        let found = locate_runner(None, "hd-runner", true).expect("allow_self 下必须能自派生");
+        // 自派生的 exe 就是当前测试进程自己
+        assert_eq!(found.exe, std::env::current_exe().unwrap());
+        assert_eq!(found.extra_args, vec!["--runner".to_string()]);
+    }
+
+    /// 自派生参数里绝不能出现令牌形态的字符串（令牌只走 stdin）。
+    #[test]
+    fn self_derived_args_never_contain_token() {
+        let found = locate_runner(None, "hd-runner", true).unwrap();
+        for a in &found.extra_args {
+            assert!(!a.starts_with("hgd_"), "自派生参数里出现了令牌：{a}");
+            assert!(!a.contains("token"), "自派生参数里出现了 token 字样：{a}");
         }
     }
 
