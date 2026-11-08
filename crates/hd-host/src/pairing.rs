@@ -34,6 +34,8 @@ pub struct PairedDevice {
     pub ws_url: String,
     /// 服务端协议版本。
     pub protocol_version: i32,
+    /// 服务端 HTTP 基址（配对时使用的地址，记入档案供重启后重连/重新配对）。
+    pub server_base_url: String,
 }
 
 /// 手写 `Debug`：`DeviceToken` 故意不实现 `Debug`（防顺手打印），
@@ -209,6 +211,7 @@ impl PairingClient {
             token: DeviceToken::new(parsed.device_token),
             ws_url,
             protocol_version: parsed.protocol_version,
+            server_base_url: self.base_url.clone(),
         })
     }
 }

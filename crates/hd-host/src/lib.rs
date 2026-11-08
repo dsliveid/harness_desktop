@@ -24,13 +24,14 @@ pub mod bootstrap;
 pub mod commands;
 pub mod daemon;
 pub mod pairing;
+pub mod profile;
 pub mod vault;
 
 #[cfg(feature = "gui")]
 pub mod gui;
 
 pub use boot_state::{plan_boot, BootStateKind, BootUiState};
-pub use bootstrap::{needs_pairing, Bootstrap, BootstrapError, BootstrapOutcome};
+pub use bootstrap::{default_ws_url, needs_pairing, Bootstrap, BootstrapError, BootstrapOutcome};
 pub use commands::{
     device_status, get_workspace_roots, list_commands, runner_status, set_workspace_roots,
     start_pairing, CommandError, DeviceStatusResponse, HostState, ListCommandsResponse,
@@ -41,6 +42,7 @@ pub use daemon::{
     ExitRecord, LineRing, RunnerState, RuntimeStats, StdinHandle, LOG_RING_CAPACITY,
 };
 pub use pairing::{ws_url_from, PairedDevice, PairingClient, PairingError};
+pub use profile::{FileProfileStore, MemoryProfileStore, Profile, ProfileError, ProfileStore};
 pub use vault::{
     default_vault, DeviceToken, MemoryVault, PlatformVault, TokenVault, VaultError,
     KEYRING_SERVICE, KEYRING_USER,

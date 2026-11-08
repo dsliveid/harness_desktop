@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::daemon::{locate_runner, Daemon};
 use crate::pairing::PairedDevice;
+use crate::profile::ProfileStore;
 use crate::vault::TokenVault;
 
 /// `ensure_running` 的结果。
@@ -72,6 +73,10 @@ pub struct Bootstrap {
     allow_self_derive: bool,
     /// 显式指定的 runner 路径（`None` 表示按约定搜索）。
     explicit_runner: Option<PathBuf>,
+    /// 本地配对档案（记住 ws_url，重启后能连回同一台服务端）。
+    ///
+    /// `None` 时回退到硬编码默认地址（兼容旧调用方与单测）。
+    profile_store: Option<Arc<dyn ProfileStore>>,
     /// WS 基址（用于日志与状态展示，实际地址在配对时已确定）。
     protocol_version: i32,
 }
@@ -90,8 +95,18 @@ impl Bootstrap {
             runner_exe_name: runner_exe_name.into(),
             allow_self_derive: false,
             explicit_runner: None,
+            profile_store: None,
             protocol_version,
         }
+    }
+
+    /// 注入本地档案存储（用于记住 ws_url）。
+    ///
+    /// 不注入时 `ensure_running` 回退到默认地址 —— 这让单测与旧调用方无需改动，
+    /// 但**生产环境必须注入**，否则连非默认服务端时重启会连错地址。
+    pub fn with_profile_store(mut self, store: Arc<dyn ProfileStore>) -> Self {
+        self.profile_store = Some(store);
+        self
     }
 
     /// 开启自派生（仅非 Windows 平台或已验证可用的环境使用）。
@@ -148,10 +163,8 @@ impl Bootstrap {
             return Ok(BootstrapOutcome::RunnerMissing { searched });
         };
 
-        // ④ 拉起。注意：ws_url 来自持久化的配对信息，此处不重新配对。
-        //    若将来需要持久化 ws_url，应一并存入密钥链旁的配置项；
-        //    当前版本由调用方在 `on_paired` 后已知道地址，故这里用占位说明。
-        let ws_url = self.ws_url_placeholder();
+        // ④ 拉起。地址来自配对档案（重启后连回同一台服务端）。
+        let ws_url = self.resolve_ws_url();
         self.daemon
             .spawn(&launch, &token, &ws_url, self.protocol_version)
             .await
@@ -167,18 +180,35 @@ impl Bootstrap {
     /// 顺序不可颠倒：若先 spawn 后落盘而落盘失败，用户会遇到「这次能用、重启后
     /// 又要重新配对，但 Runner 已经在跑」的不一致状态。
     pub async fn on_paired(&self, paired: PairedDevice) -> Result<(), BootstrapError> {
-        // ① 先持久化。失败则**不拉起**。
+        // ① 先持久化令牌。失败则**不拉起**。
         self.vault
             .set(&paired.token)
             .map_err(|e| BootstrapError::VaultWrite(e.to_string()))?;
 
-        // ② 幂等：已在跑就不重复拉起。
+        // ② 持久化「连哪台服务端」，供重启后自动连回。
+        //
+        // 失败不让整个流程失败：档案丢了最多下次回退默认地址，而令牌已存，
+        // 当前这次配对仍然可用。这种「尽量记住但不阻断」的处理比整体失败更实用。
+        if let Some(store) = self.profile_store.as_ref() {
+            let profile = crate::profile::Profile::new(
+                paired.server_base_url.clone(),
+                paired.ws_url.clone(),
+                paired.device_id.clone(),
+                paired.protocol_version,
+                crate::daemon::now_ms(),
+            );
+            if let Err(e) = store.save(&profile) {
+                tracing::warn!(error = %e, "保存配对档案失败（不影响本次配对）");
+            }
+        }
+
+        // ③ 幂等：已在跑就不重复拉起。
         if self.daemon.is_running().await {
             tracing::debug!("Runner 已在运行，配对后不重复拉起");
             return Ok(());
         }
 
-        // ③ 定位并拉起。
+        // ④ 定位并拉起。
         let Some(launch) = locate_runner(
             self.explicit_runner.as_deref(),
             &self.runner_exe_name,
@@ -207,16 +237,40 @@ impl Bootstrap {
         Ok(())
     }
 
-    /// `ensure_running` 用的 WS 地址。
+    /// 取「重启后该连哪台服务端」的 WS 地址。
     ///
-    /// 说明：完整地址本应在配对时持久化（`ws_url` 与令牌一同保存）。当前版本
-    /// 尚未引入「配对信息持久化」，故 `ensure_running` 只能使用约定地址；
-    /// 这在**单机自用**场景（固定 `127.0.0.1:5611`）下成立。
-    /// 待办：把 ws_url 一并存入本地配置，使重启后能连任意服务端。
-    fn ws_url_placeholder(&self) -> String {
-        // 保持与 commands::HostState 的默认服务端地址一致。
-        "ws://127.0.0.1:5611/api/v1/devices/ws".to_string()
+    /// 优先读本地档案（配对时记下的真实地址）；档案缺失/损坏时回退到默认地址。
+    /// 回退是必要的：首次升级的老用户磁盘上没有档案文件，不能因此连不上。
+    fn resolve_ws_url(&self) -> String {
+        if let Some(store) = self.profile_store.as_ref() {
+            match store.load() {
+                Ok(Some(p)) if p.is_usable() => return p.ws_url,
+                Ok(_) => {
+                    tracing::debug!("无可用配对档案，回退到默认服务端地址");
+                }
+                Err(e) => {
+                    // 档案读失败不阻止启动：回退默认地址，让用户至少能尝试连接。
+                    tracing::warn!(error = %e, "读取配对档案失败，回退到默认地址");
+                }
+            }
+        }
+        default_ws_url()
     }
+}
+
+/// 默认服务端地址（档案缺失时的回退值）。
+///
+/// 对齐 `harness_go` 的默认监听端口（`internal/config/config.go` 的
+/// `Default().Server.Addr` = `:5611`，且项目约定用 `127.0.0.1` 而非 `localhost`）。
+pub fn default_ws_url() -> String {
+    "ws://127.0.0.1:5611/api/v1/devices/ws".to_string()
+}
+
+/// 默认服务端 HTTP 基址（配对用）。
+///
+/// 与 [`default_ws_url`] 同源（同一台机器的 5611 端口），只是协议不同。
+pub fn default_http_url() -> String {
+    "http://127.0.0.1:5611".to_string()
 }
 
 /// 从令牌是否存在推断是否需要配对（供 UI 首屏判断，不发网络请求）。

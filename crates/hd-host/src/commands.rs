@@ -202,13 +202,14 @@ pub fn list_commands() -> ListCommandsResponse {
 ///
 /// 🔴 增删 command 必须同步改这里 + `gui.rs` 的 `invoke_handler` 注册。
 /// 未实现的 `start_pairing` 之外的「禁止实现」三兄弟永不出现（见模块文档）。
-pub const SUPPORTED_COMMANDS: [&str; 6] = [
+pub const SUPPORTED_COMMANDS: [&str; 7] = [
     "list_commands",
     "device_status",
     "runner_status",
     "get_workspace_roots",
     "set_workspace_roots",
     "get_boot_state",
+    "pair_device",
 ];
 
 /// 保留的 command 名清单（仅用于测试断言与文档，不注册）。
@@ -279,6 +280,20 @@ pub enum CommandError {
     /// 设备名称为空。
     #[error("设备名称不能为空（服务端需要它来区分多台设备）")]
     EmptyDeviceName,
+    /// 服务端明确拒绝配对（配对码无效、设备域关闭等）。
+    ///
+    /// 保留服务端错误码：UI 据此区分「码抄错了」与「服务端没开设备功能」，
+    /// 这两件事用户该做的事完全不同。
+    #[error("服务端拒绝配对（{code}）：{message}")]
+    PairRejected {
+        /// `apperr` 错误码。
+        code: String,
+        /// 可读消息。
+        message: String,
+    },
+    /// 配对过程失败（网络、spawn、档案写入等）。
+    #[error("配对失败：{0}")]
+    PairFailed(String),
 }
 
 /// `set_workspace_roots`：设置并归一工作区根，返回**归一后**的清单。
@@ -371,6 +386,99 @@ pub fn start_pairing(
         accepted: true,
         message: "配对请求已在本机排队；服务端确认后 device_status.paired 会变为 true".to_string(),
     })
+}
+
+/// 配对输入校验（纯函数，不碰网络）。
+///
+/// 抽出来是因为它被两条路径共用：同步的 [`start_pairing`]（仅校验+排队）
+/// 与异步的 [`start_pairing_real`]（校验+真实配对）。校验规则写两份必然漂移。
+pub fn validate_pair_input<'a>(
+    code: &'a str,
+    name: &'a str,
+) -> Result<(&'a str, &'a str), CommandError> {
+    let code = code.trim();
+    let name = name.trim();
+
+    if name.is_empty() {
+        return Err(CommandError::EmptyDeviceName);
+    }
+    // 只允许大写字母与数字：服务端按此格式生成，小写或含符号说明是用户手抄错了。
+    // 在这里拒掉比发给服务端再等回包快，也避免把明显的垃圾输入打到服务端日志。
+    let valid = (PAIR_CODE_MIN_LEN..=PAIR_CODE_MAX_LEN).contains(&code.len())
+        && code
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    if !valid {
+        return Err(CommandError::BadPairCode);
+    }
+    Ok((code, name))
+}
+
+/// 真实配对（异步）：调服务端换 token → 落密钥链 → 写档案 → 拉起 Runner。
+///
+/// ## 与 [`start_pairing`] 的关系
+///
+/// 旧的同步版本保留下来做**输入校验**（`validate_pair_input`），
+/// 因为它不碰网络、可纯单测；真实网络动作放在这里，避免把 IO 混进校验逻辑。
+///
+/// ## 为什么必须由 Rust 发请求
+///
+/// 响应里带 `device_token` 明文（长期凭证）。若让前端发，令牌必然经过 WebView
+/// 的 JS 堆与网络栈 —— XSS、恶意依赖、被注入的 devtools 都能拿到。
+pub async fn start_pairing_real(
+    state: &HostState,
+    code: &str,
+    name: &str,
+    server_base_url: &str,
+) -> Result<StartPairingResponse, CommandError> {
+    // ① 先做本地校验：非法输入不必打服务端（也避免把垃圾写进服务端日志）。
+    let (code, name) = validate_pair_input(code, name)?;
+
+    // ② 真实配对。
+    let client = crate::pairing::PairingClient::new(server_base_url);
+    let paired = client
+        .pair(code, name, platform_tag(), env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|e| match e {
+            crate::pairing::PairingError::Rejected { code, message } => {
+                CommandError::PairRejected { code, message }
+            }
+            other => CommandError::PairFailed(other.to_string()),
+        })?;
+
+    // ③ 落令牌 + 写档案 + 拉起 Runner（复用已 e2e 验证的 Bootstrap）。
+    let daemon = std::sync::Arc::new(crate::daemon::Daemon::new(
+        hd_runner::reconnect::ReconnectPolicy::default(),
+    ));
+    let boot = crate::bootstrap::Bootstrap::new(
+        state.vault_ref(),
+        daemon,
+        "hd-runner",
+        paired.protocol_version,
+    )
+    .with_profile_store(std::sync::Arc::new(
+        crate::profile::FileProfileStore::with_default_path(),
+    ));
+
+    boot.on_paired(paired)
+        .await
+        .map_err(|e| CommandError::PairFailed(e.to_string()))?;
+
+    Ok(StartPairingResponse {
+        accepted: true,
+        message: "配对成功，执行引擎已启动".to_string(),
+    })
+}
+
+/// 平台标识（服务端用于展示与排障，不参与鉴权）。
+fn platform_tag() -> &'static str {
+    if cfg!(windows) {
+        "windows-amd64"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
 }
 
 /// 端侧期望的协议版本（透出给前端做「客户端太旧」提示）。

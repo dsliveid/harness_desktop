@@ -101,6 +101,7 @@ async fn pair_then_runner_is_spawned() {
         token: DeviceToken::new("hgd_e2e_token_xyz".into()),
         ws_url,
         protocol_version: 1,
+        server_base_url: "http://127.0.0.1:1".into(),
     };
     // 用显式 runner 路径，避免依赖 exe_name 搜索
     let boot = boot.with_explicit_runner(Some(exe));

@@ -17,6 +17,7 @@ use tauri::{Manager, State};
 // 别名导入：下面定义的 `#[tauri::command] fn` 与纯逻辑函数同名，
 // 直接 `use` 会冲突。用 `core_` 前缀反而让「这层只是转发」更明显。
 use crate::boot_state::BootUiState;
+use crate::commands::start_pairing_real as core_start_pairing_real;
 use crate::commands::{
     device_status as core_device_status, get_workspace_roots as core_get_workspace_roots,
     runner_status as core_runner_status, set_workspace_roots as core_set_workspace_roots,
@@ -54,6 +55,24 @@ pub fn runner_status(state: State<'_, HostState>) -> RunnerStatusResponse {
 #[tauri::command]
 pub fn get_boot_state(state: State<'_, HostState>) -> BootUiState {
     state.boot_state()
+}
+
+/// 真实配对（异步 command）：调服务端 → 落 token → 写档案 → 拉起 Runner。
+///
+/// 单独一个 command 而不替换上面的同步版：
+/// 同步版被现有 5 个单测依赖（且它确实在做输入校验），
+/// 真实网络动作必须是异步的（Tauri command 支持 async）。
+#[tauri::command]
+pub async fn pair_device(
+    state: State<'_, HostState>,
+    code: String,
+    name: String,
+    server_base_url: Option<String>,
+) -> Result<StartPairingResponse, String> {
+    let base = server_base_url.unwrap_or_else(crate::bootstrap::default_http_url);
+    core_start_pairing_real(&state, &code, &name, &base)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -113,6 +132,7 @@ pub fn run() -> tauri::Result<()> {
             get_workspace_roots,
             set_workspace_roots,
             get_boot_state,
+            pair_device,
             start_pairing
         ])
         .setup(|app| {
@@ -148,7 +168,12 @@ pub fn run() -> tauri::Result<()> {
                     daemon,
                     "hd-runner",
                     hd_protocol::CURRENT_PROTOCOL_VERSION,
-                );
+                )
+                // 🔴 生产必须注入档案：否则连非默认服务端时重启会连错地址
+                // （回退到 default_ws_url 的 127.0.0.1:5611）。
+                .with_profile_store(std::sync::Arc::new(
+                    crate::profile::FileProfileStore::with_default_path(),
+                ));
 
                 let outcome = boot.ensure_running().await;
                 if let Err(e) = &outcome {
@@ -182,6 +207,7 @@ mod tests {
             "get_workspace_roots",
             "set_workspace_roots",
             "get_boot_state",
+            "pair_device",
         ];
         for name in registered {
             assert!(
