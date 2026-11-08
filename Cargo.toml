@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hd-core",
+    "crates/hd-host",
+    "crates/hd-protocol",
+    "crates/hd-runner",
+    "crates/hd-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+
+# 体积预算见 docs/桌面端架构与功能设计.md §18.4
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

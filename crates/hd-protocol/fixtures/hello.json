@@ -1,0 +1,30 @@
+{
+  "v": 1,
+  "type": "hello",
+  "id": "f-hello-1",
+  "ts": 1704067200000,
+  "payload": {
+    "name": "我的工作站",
+    "platform": "windows-amd64",
+    "app_version": "1.0.0",
+    "capabilities_hash": "sha256:abc123",
+    "protocol_version": 1,
+    "capabilities": [
+      {
+        "name": "workspace.read",
+        "version": "1",
+        "updated_at": 0
+      },
+      {
+        "name": "workspace.list",
+        "version": "1",
+        "updated_at": 0
+      },
+      {
+        "name": "process",
+        "version": "1",
+        "updated_at": 0
+      }
+    ]
+  }
+}

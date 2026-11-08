@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "type": "welcome",
+  "id": "f-welcome-1",
+  "ts": 1704067200000,
+  "payload": {
+    "device_id": "dev_0123456789abcdef",
+    "server_time": 1704067200000,
+    "protocol_version": 1,
+    "heartbeat_s": 15,
+    "offline_after_s": 45,
+    "pending": 2,
+    "lease_epoch": 7
+  }
+}

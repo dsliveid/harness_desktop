@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>harness 桌面端 · 内置基线</title>
+    <!--
+      为什么把骨架写成静态 HTML 而不是全靠 JS 生成：
+      基线是「壳里的最后一道兜底界面」。若脚本自身加载失败/抛错，静态骨架仍能让用户
+      看到标题、说明与按钮（虽不可用），而不是一片白屏 —— 这是 §14.5 的硬要求。
+      main.ts 只负责「增强」：探测服务端、探测能力、按结果置灰与写状态文案。
+    -->
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="hd">
+        <h1>harness 桌面端</h1>
+        <p class="sub">内置基线界面 · 远程 UI 未加载时的最小可用壳</p>
+      </header>
+
+      <!-- aria-live：状态变化对读屏器可播报（错误态是这台界面的主要输出） -->
+      <section id="server-status" class="card status" data-state="checking" aria-live="polite">
+        <strong class="line-title">服务端连接</strong>
+        <p class="line-detail">正在探测服务端…</p>
+      </section>
+
+      <section id="capability-status" class="card status" data-state="checking" aria-live="polite">
+        <strong class="line-title">本机能力</strong>
+        <p class="line-detail">正在读取客户端能力清单…</p>
+      </section>
+
+      <section class="card actions">
+        <div class="action">
+          <button type="button" data-cmd="check_update" disabled>检查更新</button>
+          <p class="reason" data-reason-for="check_update"></p>
+        </div>
+        <div class="action">
+          <button type="button" data-cmd="open_settings" disabled>打开设置</button>
+          <p class="reason" data-reason-for="open_settings"></p>
+        </div>
+        <div class="action">
+          <button type="button" data-cmd="open_logs" disabled>查看日志</button>
+          <p class="reason" data-reason-for="open_logs"></p>
+        </div>
+      </section>
+
+      <footer class="foot">
+        <p id="diag" class="diag">诊断信息加载中…</p>
+      </footer>
+    </div>
+
+    <noscript>
+      <p class="noscript">脚本被禁用：基线界面无法探测服务端与本机能力，仅显示静态说明。</p>
+    </noscript>
+
+    <!-- 原生 ES module，零打包依赖：构建时 esbuild 会把 src/baseline/main.ts 打成 ./main.js -->
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

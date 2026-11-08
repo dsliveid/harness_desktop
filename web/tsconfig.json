@@ -1,0 +1,26 @@
+{
+  // 基线 UI 的编译约束：只做类型检查（产物由 esbuild 打包），因此 noEmit。
+  // 故意把 strict 全家桶打开 —— 基线是「壳里的最后一道兜底界面」，
+  // 一旦它自己崩了，用户就只剩白屏，所以宁可在写码时被类型卡住。
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "types": [],
+    "strict": true,
+    "noImplicitAny": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"]
+}

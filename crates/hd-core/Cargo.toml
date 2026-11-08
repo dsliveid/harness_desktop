@@ -1,0 +1,29 @@
+[package]
+name = "hd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "harness_desktop 端侧执行面地基（执行器抽象 + 安全闸门），无网络依赖、不碰数据库"
+
+# 🔴 依赖红线（docs/桌面端架构与功能设计.md §14.2 / §14.3）：
+# 本 crate 必须能在**无网络**环境下单测安全逻辑，因此：
+#   - 禁止 reqwest / tokio-tungstenite / hyper / 任何 TLS 栈；
+#   - 禁止数据库驱动（端侧永不直写 DB，不变量 1），审计只走本地 sink。
+# 依赖「能不用就不用」，新增任一依赖都要在 PR 里说明它换来了什么。
+[dependencies]
+# 只要本地执行所需的能力：不启用 net feature（编译期就没法发网络请求）
+tokio = { version = "1", features = ["fs", "process", "time", "sync", "io-util"] }
+async-trait = "0.1" # trait 里出现 async fn，稳定版 Rust 需要它做 desugar
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+# 以下按设计文档 §14.3 预留（后续 fs.glob / fs.grep / 原子写要用），当前未使用但不算重型依赖
+walkdir = "2"
+globset = "0.4"
+tempfile = "3"
+dirs = "5"
+
+[dev-dependencies]
+# 测试要真跑 async 与真实目录树
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "time"] }

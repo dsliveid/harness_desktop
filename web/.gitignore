@@ -1,0 +1,4 @@
+# 基线 UI 的产物与中间物不入库
+node_modules/
+dist-baseline/
+test/.build/

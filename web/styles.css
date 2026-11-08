@@ -1,0 +1,168 @@
+/*
+ * 基线样式：手写 CSS，无 UI 框架、无外部字体、无图片资源。
+ * 为什么这么抠：基线要进客户端二进制，体积预算 0.6MB 是硬上限（§14.5），
+ * 而这张界面本身就是「兜底可见」，不需要任何视觉糖。
+ * 配色沿用 harness_go web 的深色习惯（#0d1117 / #8b949e），减少割裂感。
+ */
+
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --accent: #58a6ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+  /* 桌面壳内一般不可缩放窗口，居中限宽避免超宽屏拉成一行 */
+  display: flex;
+  justify-content: center;
+  padding: 32px 16px;
+}
+
+#app {
+  width: 100%;
+  max-width: 640px;
+}
+
+.hd h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.hd .sub {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+
+.status {
+  /* 左侧色条用 data-state 驱动，状态一眼可辨 */
+  border-left: 3px solid var(--border);
+}
+
+.status[data-state="ok"] {
+  border-left-color: var(--ok);
+}
+
+.status[data-state="warn"] {
+  border-left-color: var(--warn);
+}
+
+.status[data-state="error"] {
+  border-left-color: var(--err);
+}
+
+.status[data-state="checking"] {
+  border-left-color: var(--accent);
+}
+
+.line-title {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.line-detail {
+  margin: 4px 0 0;
+  word-break: break-word;
+}
+
+.line-detail.is-error {
+  color: var(--err);
+}
+
+.line-detail.is-ok {
+  color: var(--ok);
+}
+
+.line-detail.is-muted {
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.action {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: #21262d;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+button:hover:not(:disabled) {
+  background: #30363d;
+  border-color: var(--accent);
+}
+
+/* 置灰态必须是「看起来就不能点」，而不是可点但报错 —— 见 tauriBridge 注释里的既有约定 */
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.reason {
+  margin: 0;
+  min-height: 0;
+  font-size: 12px;
+  color: var(--warn);
+}
+
+.reason:empty {
+  display: none;
+}
+
+.foot {
+  margin-top: 8px;
+}
+
+.diag {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.noscript {
+  color: var(--err);
+  text-align: center;
+}

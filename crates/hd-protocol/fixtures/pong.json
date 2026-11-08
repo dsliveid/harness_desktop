@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "pong",
+  "id": "f-pong-1",
+  "ts": 1704067200000,
+  "payload": {
+    "server_time": 1704067201000,
+    "pending": 0,
+    "protocol_version": 1
+  }
+}

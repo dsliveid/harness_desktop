@@ -1,0 +1,7 @@
+# 占位文件：保持 crates/hd-host/ui/ 目录被 git 跟踪。
+#
+# 为什么需要它：Tauri 2 的 generate_context!() 在编译期读取 frontendDist（= "ui"），
+# 目录不存在会直接导致 cargo build 失败；而 git 不跟踪空目录，所以需要一个占位文件。
+#
+# 该目录的真实内容由 scripts/sync-web.ps1 / scripts/sync-web.sh 从 web/dist-baseline 同步生成，
+# 产物本身已被 .gitignore 排除，不入库。请勿删除本文件。

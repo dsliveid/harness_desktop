@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "type": "task.progress",
+  "id": "te_abc123",
+  "ts": 1704067200000,
+  "payload": {
+    "task_id": "te_abc123",
+    "run_id": "run_xyz789",
+    "tool_event_id": "te_abc123",
+    "chunk": "扫描目录 128/500…"
+  }
+}

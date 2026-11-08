@@ -1,0 +1,62 @@
+# ============================================================================
+# harness_desktop 根 .gitignore
+# 原则：只入库「源码 + 协议黄金 fixture + 占位锚点」，一切可再生成的产物/依赖/临时物一律排除。
+# ============================================================================
+
+# ---------- 1. Rust 构建产物（体积最大，几 GB 级，绝不能入库） ----------
+/target/
+**/*.rs.bk
+# Rust 增量编译与调试符号
+*.pdb
+*.exp
+
+# ---------- 2. 前端依赖与构建产物 ----------
+# node_modules：npm install 即可还原，入库会让仓库膨胀数百 MB
+node_modules/
+# web/dist-baseline：基线 UI 的 vite 构建产物，由 `cd web && npm run build` 生成。
+# 注意 web/.gitignore 已单独声明同一规则（子目录 .gitignore 与根规则并存不冲突），
+# 这里保留一份是为了「在仓库根 grep 即可看清全部排除项」，便于 CI 审计。
+web/dist-baseline/
+# 前端测试中间物
+web/test/.build/
+
+# ---------- 3. crates/hd-host/ui/：产物不入库，只保留占位锚点 ----------
+# 取舍说明（重要，勿随手删）：
+#   * crates/hd-host/ui 是 Tauri 的 frontendDist（见 crates/hd-host/tauri.conf.json: "ui"）。
+#     该目录里的真实产物由 scripts/sync-web.ps1 / sync-web.sh 从 web/dist-baseline 同步而来，
+#     属于「可再生成的构建产物」，因此默认全部排除，避免每次构建都产生无意义 diff。
+#   * 但 Tauri 2 的 generate_context!() 在【编译期】就要读取 frontendDist 目录：
+#     目录不存在会直接编译失败。所以必须入库一个占位物让「干净 clone 后 cargo build 不炸」：
+#       - .gitkeep   : 保证 ui/ 这个空目录本身能被 git 跟踪（git 不跟踪空目录）
+#       - index.html : 最小占位页（含 IPC 通路说明），保证目录里至少有一个合法入口文件
+#   * 代价（已知且接受）：执行过 sync 脚本后，被覆盖的 index.html 会显示为 modified。
+#     这是刻意的取舍 —— sync 属于「构建/打包前置步骤」，产物永远不提交；CI 里跑完 sync
+#     后不要做 git 提交，也不要拿 git status 干净与否当构建门禁。
+crates/hd-host/ui/*
+!crates/hd-host/ui/.gitkeep
+!crates/hd-host/ui/index.html
+
+# ---------- 4. 协议黄金 fixture：必须入库，禁止被任何规则误伤 ----------
+# crates/hd-protocol/fixtures/*.json 是「协议漂移门禁」（protocol-gate）的唯一事实基准：
+# 服务端/移动端/桌面端三方序列化结果必须与之逐字节一致，丢了门禁就失效。
+# 这里显式写一条否定规则做「防误伤保险」，即便将来上方新增了 *.json 类排除也不会波及它。
+!crates/hd-protocol/fixtures/*.json
+
+# ---------- 5. 临时文件与操作系统垃圾 ----------
+*.log
+*.tmp
+# agent / 构建脚本产生的临时输出（如 tmp_out.txt、tmp_err.txt）
+tmp_*.txt
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 6. Agent 元数据（本地产物，非项目资产） ----------
+# .harness/ 存放子任务黑板、计划、记忆库等 agent 运行期数据，属于「本机工作现场」，
+# 与代码无关；入库会污染历史并造成多人协作冲突。
+.harness/
+
+# ---------- 7. 编辑器/IDE ----------
+.vscode/
+.idea/
+*.swp

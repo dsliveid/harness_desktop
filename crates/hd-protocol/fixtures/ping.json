@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "type": "ping",
+  "id": "f-ping-1",
+  "ts": 1704067200000,
+  "payload": {
+    "load": {
+      "cpu": 0.42,
+      "mem": 0.61,
+      "running": 1
+    },
+    "capabilities_hash": "sha256:abc123",
+    "protocol_version": 1
+  }
+}

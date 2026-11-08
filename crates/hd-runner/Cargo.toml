@@ -1,0 +1,31 @@
+[package]
+name = "hd-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "harness_desktop 执行引擎 Runner（WS 客户端：握手 / 心跳 / 帧路由）"
+
+[dependencies]
+hd-protocol = { path = "../hd-protocol" }
+# 执行面地基：Guarded/Executor/ExecCtx。路由层只依赖它，不反向被依赖，
+# 因此引入不改变「hd-core 无网络依赖」的既有约束（这是构建方向而非 feature）。
+hd-core = { path = "../hd-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+hd-testkit = { path = "../hd-testkit" }
+# 只在测试里手写假 Executor 需要它（生产代码从不 `impl Executor`，故不进依赖区）。
+async-trait = "0.1"
+
+# 同一个 crate 既是 lib（被 hd-host / 测试复用）又是可执行程序（宿主外壳 spawn 它）。
+# 显式声明 [[bin]] 而不是靠 src/main.rs 的默认推导：路径一旦挪动，构建脚本
+# （packaging / hd-testkit 的进程级 e2e）会静默找不到二进制，显式声明能提前暴露。
+[[bin]]
+name = "hd-runner"
+path = "src/main.rs"

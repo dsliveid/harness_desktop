@@ -1,0 +1,13 @@
+[package]
+name = "hd-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "harness_desktop 设备协议线格式（唯一来源，逐字段对齐 harness_go/internal/device/protocol.go）"
+
+# 🔴 依赖红线（docs/桌面端架构与功能设计.md §14.3）：
+# 本 crate 是纯协议层，**禁止**引入 tokio / reqwest / keyring / 任何 std::fs 相关的
+# IO 能力。协议包一旦能碰 IO，就会有人把执行逻辑写进去，最终 Runner 与 Host 的边界腐烂。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

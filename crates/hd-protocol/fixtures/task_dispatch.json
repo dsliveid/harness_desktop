@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "type": "task.dispatch",
+  "id": "te_abc123",
+  "ts": 1704067200000,
+  "payload": {
+    "task_id": "te_abc123",
+    "run_id": "run_xyz789",
+    "tool_event_id": "te_abc123",
+    "tool_name": "fs.list",
+    "args": {
+      "path": "C:\\Users\\me\\work",
+      "max": 500
+    },
+    "deadline": 1704067230000,
+    "attempt": 1
+  }
+}

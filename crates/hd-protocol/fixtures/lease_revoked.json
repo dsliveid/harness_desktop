@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "type": "lease.revoked",
+  "id": "f-lease-1",
+  "ts": 1704067200000,
+  "payload": {
+    "session_id": "sess_001",
+    "epoch": 8,
+    "reason": "另一台设备接管了该会话"
+  }
+}

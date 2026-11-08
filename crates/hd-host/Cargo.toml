@@ -1,0 +1,61 @@
+[package]
+name = "hd-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "harness_desktop 桌面宿主壳（Tauri 2）：token vault / runner 守护 / IPC 控制面"
+
+[features]
+default = []
+# GUI 层（Tauri 2）默认关闭，原因见 lib.rs 顶部注释：
+# 1) GUI 依赖需要 WebView2（Windows）/ 系统 webkit（Linux），无 GUI 的 CI 上装不出来；
+# 2) 纯逻辑层（vault / daemon / commands）刻意不依赖任何 GUI 库，
+#    这样 `cargo test -p hd-host` 在任意环境都能秒级跑完。
+gui = ["dep:tauri", "dep:tauri-plugin-single-instance"]
+
+[dependencies]
+# 复用已有地基，别重写：工作区根目录白名单校验（hd-core::Policy）、
+# 退避策略与 token 打码（hd-runner::ReconnectPolicy / ipc::redact_token）。
+hd-core = { path = "../hd-core" }
+hd-protocol = { path = "../hd-protocol" }
+hd-runner = { path = "../hd-runner" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+# 令牌明文在内存里必须能被清零：手写 unsafe 清零会被 #![deny(unsafe_code)] 拦下，
+# 因此用 zeroize（它内部做了 volatile 写 + 编译器屏障）。
+zeroize = "1"
+tracing = "0.1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "sync",
+    "time",
+    "fs",
+] }
+# 可选 GUI 依赖：默认不参与编译。
+tauri = { version = "2", features = ["tray-icon"], optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
+
+# 各平台只启用对应的原生密钥链后端，避免在 Linux 上把 libdbus/openssl 拖进来。
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[dev-dependencies]
+# test-util 提供 start_paused（虚拟时钟），让退避重试的单测不用真等 30 秒。
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+# GUI 入口需要 feature gui，默认不编译（原因见 src/lib.rs 顶部）。
+# 刻意不设 build.rs / [build-dependencies]：tauri-build 的 build script 会**无条件**执行，
+# 那样默认（无 gui）构建也会跑一遍 GUI 工具链，破坏「纯逻辑层零 GUI 依赖」的分层。
+# 本轮不打包 installer，因此 `tauri::generate_context!()` 直接读 tauri.conf.json 即可。
+[[bin]]
+name = "hd-host"
+path = "src/main.rs"
+required-features = ["gui"]

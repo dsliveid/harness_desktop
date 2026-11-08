@@ -1,0 +1,13 @@
+[package]
+name = "hd-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "假服务端：本地 WS 回环，用于在服务端 L1（fs.* 派发）未落地前验证端侧协议行为"
+
+[dependencies]
+hd-protocol = { path = "../hd-protocol" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
