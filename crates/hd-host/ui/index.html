@@ -3,66 +3,58 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>harness_desktop</title>
+    <title>harness 桌面端 · 内置基线</title>
     <!--
-      占位前端（frontendDist 锚点，见 tauri.conf.json）。
-
-      为什么需要这个文件：Tauri 2 的 `generate_context!()` 在编译期就把 frontendDist
-      目录打进二进制，目录不存在会直接编译失败。真实的 UI 在 P8「基线 UI」阶段落地，
-      本轮 hd-host 的目标是「结构正确 + 可编译 + 单测覆盖」，因此这里只放一个
-      能证明 IPC 通路存活的极简页面。
-
-      🔴 安全说明：本页面只有 `list_commands` 与 `device_status` 两个只读调用。
-      永远不要在这里（或任何前端代码里）尝试读取设备令牌 —— 宿主壳压根没有
-      `get_device_token` 这个 command，见 crates/hd-host/src/commands.rs 模块文档。
+      为什么把骨架写成静态 HTML 而不是全靠 JS 生成：
+      基线是「壳里的最后一道兜底界面」。若脚本自身加载失败/抛错，静态骨架仍能让用户
+      看到标题、说明与按钮（虽不可用），而不是一片白屏 —— 这是 §14.5 的硬要求。
+      main.ts 只负责「增强」：探测服务端、探测能力、按结果置灰与写状态文案。
     -->
-    <style>
-      :root { color-scheme: light dark; }
-      body {
-        font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
-        margin: 0; padding: 32px; line-height: 1.6;
-      }
-      h1 { font-size: 18px; margin: 0 0 4px; }
-      .sub { opacity: .65; font-size: 13px; margin-bottom: 20px; }
-      pre {
-        background: rgba(127,127,127,.12); padding: 12px 14px; border-radius: 8px;
-        font-size: 12px; overflow: auto; white-space: pre-wrap; word-break: break-all;
-      }
-      .row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
-      button {
-        font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 6px;
-        border: 1px solid rgba(127,127,127,.5); background: transparent; cursor: pointer;
-      }
-      button:hover { background: rgba(127,127,127,.15); }
-    </style>
+    <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <h1>harness_desktop 宿主壳</h1>
-    <div class="sub">P4/P5/P7 薄壳占位页 · 真实界面见 P8 基线 UI</div>
+    <div id="app">
+      <header class="hd">
+        <h1>harness 桌面端</h1>
+        <p class="sub">内置基线界面 · 远程 UI 未加载时的最小可用壳</p>
+      </header>
 
-    <div class="row">
-      <button id="probe">能力探测 (list_commands)</button>
-      <button id="status">设备状态 (device_status)</button>
+      <!-- aria-live：状态变化对读屏器可播报（错误态是这台界面的主要输出） -->
+      <section id="server-status" class="card status" data-state="checking" aria-live="polite">
+        <strong class="line-title">服务端连接</strong>
+        <p class="line-detail">正在探测服务端…</p>
+      </section>
+
+      <section id="capability-status" class="card status" data-state="checking" aria-live="polite">
+        <strong class="line-title">本机能力</strong>
+        <p class="line-detail">正在读取客户端能力清单…</p>
+      </section>
+
+      <section class="card actions">
+        <div class="action">
+          <button type="button" data-cmd="check_update" disabled>检查更新</button>
+          <p class="reason" data-reason-for="check_update"></p>
+        </div>
+        <div class="action">
+          <button type="button" data-cmd="open_settings" disabled>打开设置</button>
+          <p class="reason" data-reason-for="open_settings"></p>
+        </div>
+        <div class="action">
+          <button type="button" data-cmd="open_logs" disabled>查看日志</button>
+          <p class="reason" data-reason-for="open_logs"></p>
+        </div>
+      </section>
+
+      <footer class="foot">
+        <p id="diag" class="diag">诊断信息加载中…</p>
+      </footer>
     </div>
-    <pre id="out">点击上方按钮，通过 IPC 调用宿主 command。</pre>
 
-    <script>
-      // 最小化 IPC 调用：不引入打包器，保持「占位页零构建」。
-      const out = document.getElementById("out");
-      const show = (v) => { out.textContent = JSON.stringify(v, null, 2); };
+    <noscript>
+      <p class="noscript">脚本被禁用：基线界面无法探测服务端与本机能力，仅显示静态说明。</p>
+    </noscript>
 
-      // Tauri 2 在 window.__TAURI_INTERNALS__ 上暴露 invoke。
-      const invoke = (cmd, args) =>
-        window.__TAURI_INTERNALS__.invoke(cmd, args);
-
-      document.getElementById("probe").onclick = async () => {
-        try { show(await invoke("list_commands")); }
-        catch (e) { show({ error: String(e) }); }
-      };
-      document.getElementById("status").onclick = async () => {
-        try { show(await invoke("device_status")); }
-        catch (e) { show({ error: String(e) }); }
-      };
-    </script>
+    <!-- 原生 ES module，零打包依赖：构建时 esbuild 会把 src/baseline/main.ts 打成 ./main.js -->
+    <script type="module" src="./main.js"></script>
   </body>
 </html>

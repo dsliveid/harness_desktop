@@ -13,6 +13,16 @@ default = []
 #    这样 `cargo test -p hd-host` 在任意环境都能秒级跑完。
 gui = ["dep:tauri", "dep:tauri-plugin-single-instance"]
 
+# 🔴 Tauri 2 的强约定：release 构建必须开 `custom-protocol`，否则前端资源
+# **不会**被嵌入二进制，可执行文件一启动就因找不到 `frontendDist` 而退出。
+#
+# 实证：本项目曾漏掉它，`hd-host.exe` release 构建「成功」但双击即死，
+# 且 `windows_subsystem = "windows"` 把报错也吞了，表现为「无任何反应的闪退」。
+# 排查成本极高，故在此显式声明并把「release = gui + custom-protocol」写成惯例：
+#   debug  : cargo run -p hd-host --features gui
+#   release: cargo build -p hd-host --release --features gui,custom-protocol
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 # 复用已有地基，别重写：工作区根目录白名单校验（hd-core::Policy）、
 # 退避策略与 token 打码（hd-runner::ReconnectPolicy / ipc::redact_token）。
