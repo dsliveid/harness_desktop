@@ -109,6 +109,11 @@ pub struct HostState {
     protocol_ok: RwLock<bool>,
     /// 排队的配对请求（本地校验通过后填入）。
     pending_pairing: Mutex<Option<PendingPairing>>,
+    /// 启动状态（bootstrap 异步跑完后写入，前端轮询读取）。
+    ///
+    /// 初值是 `Unknown` 而不是 `NeedsPairing`：bootstrap 是异步的，UI 可能在它
+    /// 还没跑完时就来读；给一个假的「需要配对」会让已配对用户看到多余引导。
+    boot_state: RwLock<crate::boot_state::BootUiState>,
 }
 
 /// 已受理的配对请求。
@@ -130,7 +135,26 @@ impl HostState {
             // 未握手前没有「协议不通过」的事实，默认 true 避免前端误报红。
             protocol_ok: RwLock::new(true),
             pending_pairing: Mutex::new(None),
+            boot_state: RwLock::new(crate::boot_state::BootUiState::unknown()),
         }
+    }
+
+    /// 读取当前启动状态（前端轮询）。
+    pub fn boot_state(&self) -> crate::boot_state::BootUiState {
+        self.boot_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 写入启动状态（bootstrap 完成后调用）。
+    pub fn set_boot_state(&self, state: crate::boot_state::BootUiState) {
+        *self.boot_state.write().unwrap_or_else(|e| e.into_inner()) = state;
+    }
+
+    /// 读取密钥链中的令牌（🔴 仅供宿主内部拉 Runner 使用，绝不经 command 返回）。
+    pub fn vault_ref(&self) -> Arc<dyn TokenVault> {
+        Arc::clone(&self.vault)
     }
 
     /// 当前守卫策略快照（daemon 热更新时用）。
@@ -178,12 +202,13 @@ pub fn list_commands() -> ListCommandsResponse {
 ///
 /// 🔴 增删 command 必须同步改这里 + `gui.rs` 的 `invoke_handler` 注册。
 /// 未实现的 `start_pairing` 之外的「禁止实现」三兄弟永不出现（见模块文档）。
-pub const SUPPORTED_COMMANDS: [&str; 5] = [
+pub const SUPPORTED_COMMANDS: [&str; 6] = [
     "list_commands",
     "device_status",
     "runner_status",
     "get_workspace_roots",
     "set_workspace_roots",
+    "get_boot_state",
 ];
 
 /// 保留的 command 名清单（仅用于测试断言与文档，不注册）。

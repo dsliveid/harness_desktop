@@ -19,6 +19,7 @@
 //! 否则一旦 CI 环境变化，最该被守住的那几十条断言会最先消失。
 #![deny(unsafe_code)]
 
+pub mod boot_state;
 pub mod bootstrap;
 pub mod commands;
 pub mod daemon;
@@ -28,6 +29,7 @@ pub mod vault;
 #[cfg(feature = "gui")]
 pub mod gui;
 
+pub use boot_state::{plan_boot, BootStateKind, BootUiState};
 pub use bootstrap::{needs_pairing, Bootstrap, BootstrapError, BootstrapOutcome};
 pub use commands::{
     device_status, get_workspace_roots, list_commands, runner_status, set_workspace_roots,

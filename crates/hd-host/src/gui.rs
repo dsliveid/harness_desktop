@@ -16,6 +16,7 @@ use tauri::{Manager, State};
 
 // 别名导入：下面定义的 `#[tauri::command] fn` 与纯逻辑函数同名，
 // 直接 `use` 会冲突。用 `core_` 前缀反而让「这层只是转发」更明显。
+use crate::boot_state::BootUiState;
 use crate::commands::{
     device_status as core_device_status, get_workspace_roots as core_get_workspace_roots,
     runner_status as core_runner_status, set_workspace_roots as core_set_workspace_roots,
@@ -43,6 +44,16 @@ pub fn device_status(state: State<'_, HostState>) -> DeviceStatusResponse {
 #[tauri::command]
 pub fn runner_status(state: State<'_, HostState>) -> RunnerStatusResponse {
     core_runner_status(&state)
+}
+
+/// 读取启动状态（前端首屏据此决定显示配对引导 / 正常 / 错误提示）。
+///
+/// 单独一个 command 而不是塞进 `device_status`：`device_status` 回答「设备是否在线」，
+/// 这个回答「宿主启动流程走到哪一步」。两者生命周期不同（启动状态一次定型，
+/// 设备状态持续变化），混在一起会让前端难以区分「还没开始」与「连不上」。
+#[tauri::command]
+pub fn get_boot_state(state: State<'_, HostState>) -> BootUiState {
+    state.boot_state()
 }
 
 #[tauri::command]
@@ -101,6 +112,7 @@ pub fn run() -> tauri::Result<()> {
             runner_status,
             get_workspace_roots,
             set_workspace_roots,
+            get_boot_state,
             start_pairing
         ])
         .setup(|app| {
@@ -110,6 +122,43 @@ pub fn run() -> tauri::Result<()> {
                 // Tauri 2 的 set_tooltip 收 `Option<S>`（`None` 表示清除悬浮提示）。
                 let _ = tray.set_tooltip(Some("harness_desktop"));
             }
+
+            // 🔴 启动编排：把「已配对」变成「Runner 在跑」。
+            //
+            // 为什么用 `tauri::async_runtime::spawn` 而不是 `block_on`：
+            // 阻塞会让窗口首帧延后（用户看到几秒白屏），而启动 Runner 需要
+            // 建连接、读密钥链，全是 IO。spawn 后立即返回，窗口先出来。
+            //
+            // 为什么失败也不 return Err：用户最在意「界面能不能开」。Runner 起不来
+            // 应该是一个**可见的状态**（前端读 get_boot_state 显示原因），
+            // 而不是「打不开」。
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let Some(state) = handle.try_state::<HostState>() else {
+                    tracing::warn!("启动编排跳过：HostState 不可用");
+                    return;
+                };
+
+                // 复用上一轮已 e2e 验证的 Bootstrap；Runner 可执行文件名按平台约定。
+                let daemon = std::sync::Arc::new(crate::daemon::Daemon::new(
+                    hd_runner::reconnect::ReconnectPolicy::default(),
+                ));
+                let boot = crate::bootstrap::Bootstrap::new(
+                    state.vault_ref(),
+                    daemon,
+                    "hd-runner",
+                    hd_protocol::CURRENT_PROTOCOL_VERSION,
+                );
+
+                let outcome = boot.ensure_running().await;
+                if let Err(e) = &outcome {
+                    tracing::warn!(error = %e, "启动编排失败");
+                }
+                let ui = crate::boot_state::plan_boot(outcome);
+                tracing::info!(state = ?ui.state, detail = %ui.detail, "启动状态已确定");
+                state.set_boot_state(ui);
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -132,6 +181,7 @@ mod tests {
             "runner_status",
             "get_workspace_roots",
             "set_workspace_roots",
+            "get_boot_state",
         ];
         for name in registered {
             assert!(
