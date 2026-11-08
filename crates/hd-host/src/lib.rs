@@ -19,13 +19,16 @@
 //! 否则一旦 CI 环境变化，最该被守住的那几十条断言会最先消失。
 #![deny(unsafe_code)]
 
+pub mod bootstrap;
 pub mod commands;
 pub mod daemon;
+pub mod pairing;
 pub mod vault;
 
 #[cfg(feature = "gui")]
 pub mod gui;
 
+pub use bootstrap::{needs_pairing, Bootstrap, BootstrapError, BootstrapOutcome};
 pub use commands::{
     device_status, get_workspace_roots, list_commands, runner_status, set_workspace_roots,
     start_pairing, CommandError, DeviceStatusResponse, HostState, ListCommandsResponse,
@@ -35,6 +38,7 @@ pub use daemon::{
     build_auth_line, build_reload_policy_line, exe_suffix, locate_runner, Daemon, DaemonError,
     ExitRecord, LineRing, RunnerState, RuntimeStats, StdinHandle, LOG_RING_CAPACITY,
 };
+pub use pairing::{ws_url_from, PairedDevice, PairingClient, PairingError};
 pub use vault::{
     default_vault, DeviceToken, MemoryVault, PlatformVault, TokenVault, VaultError,
     KEYRING_SERVICE, KEYRING_USER,

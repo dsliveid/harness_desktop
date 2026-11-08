@@ -36,6 +36,16 @@ thiserror = "1"
 # 因此用 zeroize（它内部做了 volatile 写 + 编译器屏障）。
 zeroize = "1"
 tracing = "0.1"
+# 仅配对用（设计文档 §14.3 明确许可）：把 device_token 从 HTTP 响应直接接进
+# DeviceToken(zeroize)，避免令牌经过 WebView 的 JS 堆。
+# 用 rustls 而非 native-tls：免去 Windows 上对 OpenSSL/schannel 的构建依赖。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "charset",
+    "http2",
+] }
+url = "2"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
