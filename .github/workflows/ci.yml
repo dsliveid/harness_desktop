@@ -1,0 +1,227 @@
+# harness_desktop CI：四门禁
+#
+# 设计依据：docs 中的桌面端架构设计 §18.2「CI 四门禁」。
+#   1. protocol-gate  最快，先跑。守 Go/Rust 协议双写漂移这条最高危红线。
+#   2. lint           fmt + clippy（-D warnings，警告即失败）。
+#   3. test           全工作区单测。
+#   4. build          release 产物可编译（含 GUI feature）。
+#
+# 平台选择：项目主目标平台是 Windows（NSIS 安装包 + WebView2），
+# 因此统一在 windows-latest 上跑，避免「Linux 绿、Windows 红」的假绿。
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新提交取消旧运行，省 runner 时间
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 提升编译日志可读性
+  CARGO_TERM_COLOR: always
+  # 关掉增量编译，CI 上是净亏（每次都是冷目录）
+  CARGO_INCREMENTAL: "0"
+  # 让 tauri 相关 crate 在无交互环境下安静构建
+  CI: "true"
+
+jobs:
+  # ---------------------------------------------------------------- 门禁 1
+  protocol-gate:
+    name: 协议漂移门禁
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      # 若仓库配置了该 secret，则额外做「跨仓重新生成 + diff」的强校验；
+      # 没有该 secret 时自动降级为仓库内弱校验（见下方步骤说明）。
+      HARNESS_GO_TOKEN: ${{ secrets.HARNESS_GO_TOKEN }}
+    steps:
+      - name: 检出 harness_desktop
+        uses: actions/checkout@v4
+        with:
+          # 需要完整历史才能与 base 分支做 diff
+          fetch-depth: 0
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 每个 job 独立 key，避免 lint/test/build 互相污染缓存
+          shared-key: protocol-gate
+
+      # 弱校验（无跨仓权限时的兜底）：
+      # fixtures 是 Go 侧序列化的镜像，本身不能手改。若本 PR 改动了 fixtures，
+      # 必须带上 protocol-sync 标签，表示「已同步更新 Go 侧并重新生成」。
+      # 这样既拦住了手改 fixture 的行为，又不强依赖跨仓访问。
+      - name: 校验 fixtures 改动须有 protocol-sync 标签
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          echo "对比基线：$base"
+          if git diff --quiet "$base"...HEAD -- crates/hd-protocol/fixtures/; then
+            echo "✅ fixtures 未改动，跳过标签校验"
+          else
+            echo "⚠️ 本次 PR 改动了 crates/hd-protocol/fixtures/："
+            git diff --stat "$base"...HEAD -- crates/hd-protocol/fixtures/
+            labels='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+            if echo "$labels" | grep -q 'protocol-sync'; then
+              echo "✅ 已带 protocol-sync 标签，放行"
+            else
+              echo "❌ fixtures 是 Go 侧自动生成的镜像，禁止手改。"
+              echo "   正确做法：改 harness_go/internal/device/protocol.go 后，"
+              echo "   在 harness_go 跑 scripts/gen-protocol-fixtures.ps1 重新生成，"
+              echo "   再为本 PR 打上 protocol-sync 标签。"
+              exit 1
+            fi
+          fi
+
+      # 强校验（配置了 HARNESS_GO_TOKEN 时）：真正重新生成再比 diff。
+      # 这是唯一能证明「fixture 反映当前服务端实现」的手段。
+      - name: 跨仓重新生成 fixtures 并比对（需 HARNESS_GO_TOKEN）
+        if: env.HARNESS_GO_TOKEN != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.HARNESS_GO_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "检出 harness_go 到同级目录 ../harness_go"
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/harness_go.git" \
+            ../harness_go
+          cd ../harness_go
+          echo "重新生成协议 fixture"
+          go run scripts/gen-fixtures.go -out ../harness_desktop/crates/hd-protocol/fixtures
+          cd ../harness_desktop
+          if git diff --exit-code -- crates/hd-protocol/fixtures/; then
+            echo "✅ fixture 与服务端当前实现一致"
+          else
+            echo "❌ 服务端协议变了但 fixture 没重新生成并提交"
+            exit 1
+          fi
+
+      - name: 协议 golden fixture 测试
+        run: cargo test -p hd-protocol --locked
+
+  # ---------------------------------------------------------------- 门禁 2
+  lint:
+    name: 格式与静态检查
+    needs: protocol-gate
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+
+      - name: rustfmt 检查
+        run: cargo fmt --all --check
+
+      - name: clippy（警告即错误）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: clippy（含 gui feature）
+        # GUI 层默认不编译（见 crates/hd-host/Cargo.toml 顶部注释），
+        # 必须单独跑一次，否则 GUI 代码的 lint 会成为盲区。
+        run: cargo clippy -p hd-host --features gui --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------- 门禁 3
+  test:
+    name: 单元与集成测试
+    needs: lint
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+
+      - name: 全工作区测试
+        run: cargo test --workspace --locked
+
+  # ---------------------------------------------------------------- 门禁 4
+  build:
+    name: release 构建
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+
+      # hd-host 用 `tauri::generate_context!()` 在编译期读取 tauri.conf.json 的
+      # frontendDist（= ui/）。该目录是构建产物、不入库，缺失会直接编译失败，
+      # 所以编译前必须先准备好前端产物。
+      - name: 准备前端产物到 crates/hd-host/ui
+        shell: pwsh
+        run: |
+          $ui = "crates/hd-host/ui"
+          if (Test-Path "scripts/sync-web.ps1") {
+            Write-Host "使用项目脚本 scripts/sync-web.ps1 同步前端产物"
+            & ./scripts/sync-web.ps1
+          } elseif (Test-Path "web/dist-baseline") {
+            Write-Host "回退：直接复制 web/dist-baseline 到 $ui"
+            New-Item -ItemType Directory -Force -Path $ui | Out-Null
+            Copy-Item -Recurse -Force "web/dist-baseline/*" $ui
+          } else {
+            Write-Host "回退：使用仓库内 ui 占位页"
+          }
+          if (-not (Test-Path "$ui/index.html")) {
+            throw "缺少 $ui/index.html，frontendDist 目录不可为空（go:embed 式的编译期硬依赖）"
+          }
+
+      - name: 构建 hd-runner（release）
+        run: cargo build -p hd-runner --bin hd-runner --release --locked
+
+      - name: 构建 hd-host（release，含 gui）
+        run: cargo build -p hd-host --features gui --release --locked
+
+      - name: 记录产物体积
+        shell: pwsh
+        run: |
+          Get-ChildItem target/release/*.exe | ForEach-Object {
+            "{0,-24} {1,10:N0} 字节 ({2:N2} MB)" -f $_.Name, $_.Length, ($_.Length / 1MB)
+          }
+
+      - name: 上传 release 二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-desktop-binaries
+          path: |
+            target/release/hd-host.exe
+            target/release/hd-runner.exe
+          if-no-files-found: warn
+          retention-days: 7
