@@ -23,8 +23,11 @@ pub mod boot_state;
 pub mod bootstrap;
 pub mod commands;
 pub mod daemon;
+pub mod instance_lock;
+pub mod lifecycle;
 pub mod pairing;
 pub mod profile;
+pub mod supervisor;
 pub mod vault;
 
 #[cfg(feature = "gui")]

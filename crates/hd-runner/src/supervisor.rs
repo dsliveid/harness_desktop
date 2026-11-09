@@ -170,6 +170,41 @@ pub enum StopReason {
     },
 }
 
+impl StopReason {
+    /// 映射到进程退出码（契约见 `hd_protocol::exit_code`）。
+    ///
+    /// ## 为什么映射放在这里而不是调用方
+    ///
+    /// 「终止原因 → 退出码」是 `StopReason` 自身的语义延伸，写在这里能让
+    /// **穷尽性检查**替我们兜底：将来有人给 `StopReason` 新增变体，会在这里
+    /// 编译失败，而不是悄悄落到某个 `_ =>` 兜底分支上。
+    ///
+    /// ## 判定依据
+    ///
+    /// `RejectedByServer` 携带的是服务端帧级错误码，语义差异很大，必须逐个区分：
+    /// 被吊销要清令牌重配对，被替换则连重启都不该做（会互踢）。
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        use hd_protocol::exit_code as ec;
+
+        match self {
+            StopReason::RejectedByServer { code } => match code.as_str() {
+                // 字面量与 `hd_protocol::error_code` 的 FRAME_REVOKED / DEVICE_REVOKED 相同。
+                "device.revoked" => ec::EXIT_REVOKED,
+                // 被新连接替换：重启只会把对方踢掉，形成互踢循环。
+                "device.replaced" => ec::EXIT_REPLACED,
+                // 协议不匹配：重试不会让版本变匹配。
+                "device.protocol_mismatch" => ec::EXIT_PROTOCOL_MISMATCH,
+                // 其余帧级拒绝（如 task_unsupported / server_closing）按配置性问题处理：
+                // 不重启，让宿主把原因带给用户，而不是盲目重试掩盖真正的问题。
+                _ => ec::EXIT_NO_AUTH,
+            },
+            // 重试预算耗尽：典型的「服务端没起来 / 本机断网」，修好即可恢复。
+            StopReason::AttemptsExhausted { .. } => ec::EXIT_RETRYABLE,
+        }
+    }
+}
+
 impl fmt::Display for StopReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -872,6 +907,80 @@ mod tests {
             frames: VecDeque::new(),
             outbox: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    #[test]
+    fn exit_code_maps_each_stop_reason() {
+        use hd_protocol::exit_code as ec;
+
+        // 吊销：宿主必须据此清令牌重配对。
+        assert_eq!(
+            StopReason::RejectedByServer {
+                code: error_code::FRAME_REVOKED.to_string()
+            }
+            .exit_code(),
+            ec::EXIT_REVOKED
+        );
+
+        // 被替换：不能重启，否则与对方互踢。
+        assert_eq!(
+            StopReason::RejectedByServer {
+                code: error_code::FRAME_REPLACED.to_string()
+            }
+            .exit_code(),
+            ec::EXIT_REPLACED
+        );
+
+        // 协议不匹配：重试不会让版本变匹配。
+        assert_eq!(
+            StopReason::RejectedByServer {
+                code: error_code::FRAME_PROTOCOL_MISMATCH.to_string()
+            }
+            .exit_code(),
+            ec::EXIT_PROTOCOL_MISMATCH
+        );
+
+        // 重试耗尽：网络类问题，允许宿主退避重启。
+        assert_eq!(
+            StopReason::AttemptsExhausted { attempts: 5 }.exit_code(),
+            ec::EXIT_RETRYABLE
+        );
+    }
+
+    #[test]
+    fn exit_code_never_restarts_on_terminal_reasons() {
+        use hd_protocol::exit_code as ec;
+
+        // 三条终止性原因都不允许宿主重启——这是「不产生无效重启循环」的硬约束。
+        for code in [
+            error_code::FRAME_REVOKED,
+            error_code::FRAME_REPLACED,
+            error_code::FRAME_PROTOCOL_MISMATCH,
+        ] {
+            let reason = StopReason::RejectedByServer {
+                code: code.to_string(),
+            };
+            assert!(
+                !ec::should_restart(Some(reason.exit_code())),
+                "{code} 对应的退出码不应触发宿主重启"
+            );
+        }
+
+        // 重试耗尽则应当重启。
+        assert!(ec::should_restart(Some(
+            StopReason::AttemptsExhausted { attempts: 5 }.exit_code()
+        )));
+    }
+
+    #[test]
+    fn unknown_frame_code_falls_back_to_no_restart() {
+        use hd_protocol::exit_code as ec;
+
+        // 未识别的帧级拒绝：宁可不重启也不盲目重试，避免掩盖真实原因。
+        let reason = StopReason::RejectedByServer {
+            code: "device.some_future_code".to_string(),
+        };
+        assert!(!ec::should_restart(Some(reason.exit_code())));
     }
 
     #[tokio::test]

@@ -33,14 +33,25 @@ pub enum BootstrapOutcome {
     },
     /// 密钥链里没有令牌 —— 需要用户走配对流程。
     NeedsPairing,
-    /// 有令牌但找不到 Runner 可执行文件。
+    /// 有令牌但**定位不到任何 Runner 启动方式**（自派生与兜底路径都失败）。
     ///
-    /// 这是**打包/部署**问题（用户只拷了 hd-host.exe 而漏了 hd-runner.exe），
-    /// 与配对无关，故单独一个分支以便 UI 给出可操作提示。
+    /// 单包模式下自派生总会命中，因此本分支正常不会出现；一旦出现，说明
+    /// `current_exe()` 取不到（极端的进程环境），属于**程序自身异常**而非用户漏拷文件。
+    /// 保留独立分支是为了给出可操作提示，而不是含糊地报「启动失败」。
     RunnerMissing {
-        /// 已搜索的路径描述，便于用户自查。
+        /// 已搜索的路径描述，便于排障。
         searched: String,
     },
+    /// 本机**已有别的进程**在负责 Runner，本实例不再拉起（不算失败）。
+    ///
+    /// 触发条件：本机独占锁被他人持有。典型场景是用户双击了两次图标，
+    /// 或上一个实例还在托盘驻留。
+    ///
+    /// 为什么单列一个变体而不是复用 `Started`：两者的后续行为不同 ——
+    /// `Started` 意味着「Runner 由我拉起、我能管它」，而这里 Runner 的 stdin
+    /// 写端在别人手里，本实例**既下发不了策略也不能优雅停止它**。
+    /// 混为一谈会让 UI 显示「一切正常」，实际本实例对执行引擎毫无控制权。
+    ExternallyRunning,
 }
 
 /// 启动编排失败。
@@ -62,14 +73,29 @@ pub struct Bootstrap {
     vault: Arc<dyn TokenVault>,
     daemon: Arc<Daemon>,
     /// Runner 可执行文件名（默认 `hd-runner` + 平台后缀）。
+    ///
+    /// 单包模式下这个名字**只在「显式路径 / 同目录独立文件」两种兜底场景**用到；
+    /// 默认走自派生（宿主自身 + `--runner`），不依赖此文件名。
     runner_exe_name: String,
     /// 是否允许「宿主自身 + `--runner`」自派生。
     ///
-    /// 🔴 **默认必须为 false**：链接了 Tauri 的 exe 被父进程经 `Stdio::piped()`
-    /// 拉起时，Windows 下会在加载期以 `0xC0000139` 崩溃（stderr 为空，从未进入
-    /// `main()`）；而独立的 `hd-runner.exe` 走同一条 spawn 路径完全正常。
-    /// 这是 Tauri 加载期初始化与管道子进程上下文的冲突，不是业务逻辑缺陷。
-    /// 详见 `docs/桌面端架构与功能设计.md` §3.2.1 的实测记录。
+    /// 🔴 **默认 true**（单包分发）。
+    ///
+    /// ## 曾经这里写的是「默认必须 false」，那是基于一次误判
+    ///
+    /// 旧注释称：链接了 Tauri 的 exe 被父进程经 `Stdio::piped()` 拉起时，Windows 下
+    /// 会在加载期以 `0xC0000139` 崩溃。**该结论只在 `windows`（无控制台）子系统下成立。**
+    ///
+    /// 实测（2026-11，本仓库探针，复刻 `Stdio::piped()` + 写 stdin 的完整场景）：
+    ///
+    /// | 子系统 | GUI 双击 | 自派生 |
+    /// | --- | --- | --- |
+    /// | `windows` | 无黑框 | ❌ 加载期 `0xC0000139` |
+    /// | `console` | 闪黑框 | ✅ 正常（进 main()、读 stdin、退出码 2，约 51ms） |
+    ///
+    /// `hd-host/src/main.rs` 已显式选择 console 子系统，因此自派生可用，
+    /// 单包分发成为默认形态。代价是 GUI 双击时闪一下控制台窗口
+    /// （可由 NSIS 快捷方式 `ShowWindow=Hidden` 规避，见 `scripts/build-exe.ps1`）。
     allow_self_derive: bool,
     /// 显式指定的 runner 路径（`None` 表示按约定搜索）。
     explicit_runner: Option<PathBuf>,
@@ -79,6 +105,13 @@ pub struct Bootstrap {
     profile_store: Option<Arc<dyn ProfileStore>>,
     /// WS 基址（用于日志与状态展示，实际地址在配对时已确定）。
     protocol_version: i32,
+    /// 当前守卫策略的取值函数（守护循环重启后重放用）。
+    ///
+    /// 为什么要注入而不是直接读 `HostState`：`Bootstrap` 位于 `commands` 的下层，
+    /// 反向依赖会让「状态层 → 编排层」出现环。注入一个 `Fn` 保持单向依赖，
+    /// 同时让单测可以不构造整个 `HostState`。
+    policy_source:
+        Option<std::sync::Arc<dyn Fn() -> hd_core::security::guard::Policy + Send + Sync>>,
 }
 
 impl Bootstrap {
@@ -93,11 +126,26 @@ impl Bootstrap {
             vault,
             daemon,
             runner_exe_name: runner_exe_name.into(),
-            allow_self_derive: false,
+            // 单包分发：默认启用自派生（详见字段文档的实测表）。
+            allow_self_derive: true,
             explicit_runner: None,
             profile_store: None,
             protocol_version,
+            policy_source: None,
         }
+    }
+
+    /// 注入「当前守卫策略」的取值函数（守护循环重启后重放用）。
+    ///
+    /// 不注入时回退为空白名单策略 —— 与 Runner 启动时的默认一致，
+    /// 不会意外放宽或收紧权限。
+    #[must_use]
+    pub fn with_policy_source(
+        mut self,
+        f: std::sync::Arc<dyn Fn() -> hd_core::security::guard::Policy + Send + Sync>,
+    ) -> Self {
+        self.policy_source = Some(f);
+        self
     }
 
     /// 注入本地档案存储（用于记住 ws_url）。
@@ -109,7 +157,9 @@ impl Bootstrap {
         self
     }
 
-    /// 开启自派生（仅非 Windows 平台或已验证可用的环境使用）。
+    /// 开关自派生（默认已开启；主要用于排查问题时**关闭**它）。
+    ///
+    /// 关闭后退化为「同目录独立 runner」路径，需要旁边真的存在 `hd-runner.exe`。
     pub fn with_self_derive(mut self, allow: bool) -> Self {
         self.allow_self_derive = allow;
         self
@@ -126,8 +176,15 @@ impl Bootstrap {
     /// **幂等**：Runner 已在运行时不重复 spawn —— 重复 spawn 会让同一设备
     /// 开两条 WS 连接，服务端会给旧连接发 `device.replaced` 并断开，
     /// 表现为「一启动就断线」的诡异现象。
+    ///
+    /// ## 两级幂等判据（缺一不可）
+    ///
+    /// 1. **本进程句柄**（`daemon.is_running()`）：覆盖「同一宿主重复调用
+    ///    `ensure_running`」的场景（启动编排 + 配对完成各调一次）。
+    /// 2. **本机独占锁**（[`InstanceLock`]）：覆盖「另一个宿主进程已经拉起过」的
+    ///    场景。第 1 条看不见别的进程，只靠它会双开。
     pub async fn ensure_running(&self) -> Result<BootstrapOutcome, BootstrapError> {
-        // ① 已在运行 → 直接返回成功（幂等）。
+        // ① 本进程已在运行 → 直接返回成功（幂等）。
         if self.daemon.is_running().await {
             tracing::debug!("Runner 已在运行，跳过重复拉起");
             return Ok(BootstrapOutcome::Started {
@@ -137,6 +194,9 @@ impl Bootstrap {
 
         // ② 读令牌。`Ok(None)` 是「未配对」，与「读失败」严格区分：
         //    前者引导用户去配对，后者要报错（可能是密钥链被锁）。
+        //
+        //    放在抢锁之前：没令牌时根本不需要拉起 Runner，也就不该占用实例锁
+        //    （否则「未配对」的窗口会一直挡着另一个真能工作的实例）。
         let token = self
             .vault
             .get()
@@ -145,7 +205,21 @@ impl Bootstrap {
             return Ok(BootstrapOutcome::NeedsPairing);
         };
 
-        // ③ 定位 runner。
+        // ③ 抢本机独占锁 —— 「本机有没有别的宿主已经在负责 Runner」的唯一可信判据。
+        //
+        //    为什么不能用「读 pid 再判进程存活」：pid 会被复用，会出现「明明没人在跑
+        //    却拒绝启动」或「持锁者已崩溃却永远卡住」两类误判。OS 独占锁在进程以任何
+        //    方式死亡时由内核释放，天然不留 stale。
+        //
+        //    锁在这里**交给 Daemon 持有**：它的生命周期必须覆盖 Runner 的整个运行期，
+        //    若留在 `Bootstrap` 的局部变量里，函数一返回锁就释放，
+        //    下一个宿主会立刻误判「没人在跑」并再 spawn 一份。
+        if !self.acquire_instance_lock().await? {
+            tracing::info!("本机已有执行引擎在运行，本实例不再拉起 Runner");
+            return Ok(BootstrapOutcome::ExternallyRunning);
+        }
+
+        // ④ 定位 runner。
         let Some(launch) = locate_runner(
             self.explicit_runner.as_deref(),
             &self.runner_exe_name,
@@ -160,6 +234,8 @@ impl Bootstrap {
                 ),
             };
             tracing::warn!(searched = %searched, "找不到 Runner 可执行文件");
+            // 拉起失败要把锁还回去，否则本机会一直显示「外部已在运行」而实际没人在跑。
+            self.daemon.release_instance_lock();
             return Ok(BootstrapOutcome::RunnerMissing { searched });
         };
 
@@ -173,6 +249,147 @@ impl Bootstrap {
         Ok(BootstrapOutcome::Started {
             device_id_hint: String::new(),
         })
+    }
+
+    /// 守护循环：**Runner 意外退出后按策略自动重启**（需求②的核心）。
+    ///
+    /// ## 它做什么
+    ///
+    /// ```text
+    /// loop {
+    ///     exit = daemon.wait_exit()          // 阻塞到子进程死
+    ///     action = guard.on_exit(exit)       // 纯逻辑决策（见 supervisor::Guard）
+    ///     match action {
+    ///         Stop    => 退出循环（含清令牌的 repair 分支）
+    ///         Restart => 睡 delay → 重新 spawn → 重放工作区白名单 → 继续
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// ## 为什么重启后必须重放 policy
+    ///
+    /// Runner 每次启动的 `Policy` 来自 `initial_roots()`，那只是**进程当前目录**。
+    /// 用户配置的精确白名单靠宿主经 `reload_policy` 下发。重启后若不重放，
+    /// 白名单会静默回退成 CWD —— 表现为「重启后某些目录突然不能访问了」，
+    /// 且日志里看不出异常（`reload_policy` 不会报错，它只是没被调用）。
+    ///
+    /// ## 为什么先睡退避再 spawn，而不是先 spawn 再睡
+    ///
+    /// 服务端可能正处于重启中。先睡能把「同时重连」的峰值摊平，
+    /// 也避免在明显不可能成功时反复握手（每次握手都会在服务端留审计）。
+    ///
+    /// 返回最终停止的原因，供调用方更新 UI。
+    pub async fn supervise(
+        &self,
+        guard: &mut crate::supervisor::Guard,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::supervisor::GuardAction {
+        use crate::supervisor::GuardAction;
+
+        loop {
+            // ① 阻塞等子进程退出。`None` 表示当前根本没有子进程（比如刚被 shutdown），
+            //    此时没有「退出事件」可判定，直接结束循环。
+            let Some(exit) = self.daemon.wait_exit().await else {
+                return GuardAction::Stop {
+                    phase: self.daemon.stats().state(),
+                    repair: false,
+                };
+            };
+
+            // ② 用户主动停止：立刻结束，不进入退避。
+            if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                return GuardAction::Stop {
+                    phase: self.daemon.stats().state(),
+                    repair: false,
+                };
+            }
+
+            // ③ 决策（纯逻辑，已单测穷举）。
+            let action = guard.on_exit(exit, crate::lifecycle::RunnerPhase::Running);
+
+            match action {
+                GuardAction::Stop { phase, repair } => {
+                    if repair {
+                        // 令牌已失效：清掉本地凭据，让用户重新配对。
+                        // 顺序：先清档案再清令牌 —— 档案是明文，令牌在密钥链，
+                        // 若中途失败，至少不会留下「有令牌但连错服务器」的状态。
+                        if let Some(store) = self.profile_store.as_ref() {
+                            let _ = store.clear();
+                        }
+                        let _ = self.vault.clear();
+                        tracing::warn!("Runner 终止且需重新配对，本地凭据已清理");
+                    }
+                    self.daemon.stats().set_state(phase);
+                    return GuardAction::Stop { phase, repair };
+                }
+                GuardAction::Restart { attempt, delay } => {
+                    self.daemon
+                        .stats()
+                        .set_state(crate::lifecycle::RunnerPhase::Backoff);
+                    tracing::info!(attempt, delay = ?delay, "Runner 已退出，退避后重启");
+
+                    // ④ 退避等待，但**逐段检查** shutdown：用户可能在这期间点退出，
+                    //    若一次性 sleep 完整 delay，退出最多要等 30 秒才生效。
+                    if wait_or_shutdown(delay, &shutdown).await {
+                        return GuardAction::Stop {
+                            phase: self.daemon.stats().state(),
+                            repair: false,
+                        };
+                    }
+
+                    // ⑤ 重新拉起（复用完整编排：读令牌 → 定位 → spawn）。
+                    match self.ensure_running().await {
+                        Ok(BootstrapOutcome::Started { .. }) => {
+                            // ⑥ 重放工作区白名单（见上文「为什么必须重放」）。
+                            let policy = self.current_policy();
+                            if let Err(e) = self.daemon.reload_policy(&policy).await {
+                                // 重放失败不该终止守护：下一轮重启还能再试，
+                                // 且 Runner 至少已经起来了（用 CWD 兜底）。
+                                tracing::warn!(error = %e, "重启后重放工作区白名单失败");
+                            }
+                            tracing::info!(attempt, "Runner 已重新拉起");
+                        }
+                        Ok(other) => {
+                            // 未配对 / 外部实例接管 / 找不到 exe —— 都不该继续循环。
+                            tracing::warn!(outcome = ?other, "重启未能拉起 Runner，结束守护");
+                            return GuardAction::Stop {
+                                phase: crate::lifecycle::RunnerPhase::GaveUp,
+                                repair: false,
+                            };
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "重启失败，结束守护");
+                            return GuardAction::Stop {
+                                phase: crate::lifecycle::RunnerPhase::GaveUp,
+                                repair: false,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 当前生效的守卫策略快照（供重启后重放下发）。
+    ///
+    /// 用 `bearer_policy()` 这类「外部注入」的方式会让循环依赖变复杂，
+    /// 故这里让调用方通过 [`Bootstrap::with_policy_source`] 注入一个取值函数；
+    /// 未注入时回退为「空白名单 + 不限工具」，与 Runner 启动时的默认一致。
+    fn current_policy(&self) -> hd_core::security::guard::Policy {
+        match self.policy_source.as_ref() {
+            Some(f) => f(),
+            None => hd_core::security::guard::Policy::new(Vec::new(), Vec::new()),
+        }
+    }
+
+    /// 抢占本机实例锁（薄包装：把 `io::Error` 翻成 `BootstrapError`）。
+    ///
+    /// 抽出来是为了让 `ensure_running` 的主流程读起来只有「读令牌 → 抢锁 → 定位 → 拉起」
+    /// 四步，不被错误映射干扰。
+    async fn acquire_instance_lock(&self) -> Result<bool, BootstrapError> {
+        self.daemon
+            .acquire_instance_lock()
+            .map_err(|e| BootstrapError::Spawn(format!("实例锁不可用：{e}")))
     }
 
     /// 配对成功后调用：**先落令牌，再拉起 Runner**。
@@ -280,6 +497,32 @@ pub fn needs_pairing(vault: &dyn TokenVault) -> bool {
     !matches!(vault.get(), Ok(Some(_)))
 }
 
+/// 退避等待，但**逐段检查**用户是否要求停止。
+///
+/// 返回 `true` 表示「等待期间被要求停止，调用方应放弃重启」。
+///
+/// 为什么不用 `tokio::select!` 配合通知 channel：这里的取消源只有一个原子标志，
+/// 每 100ms 轮询一次足够（最坏多等 100ms，相对 1~30s 的退避可忽略），
+/// 而不必引入 broadcast/watch 这类需要管理生命周期的原语。
+async fn wait_or_shutdown(
+    total: std::time::Duration,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if shutdown.load(Ordering::SeqCst) {
+            return true;
+        }
+        let step = remaining.min(SLICE);
+        tokio::time::sleep(step).await;
+        remaining = remaining.saturating_sub(step);
+    }
+    shutdown.load(Ordering::SeqCst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,10 +546,13 @@ mod tests {
 
     #[tokio::test]
     async fn runner_missing_reports_search_path() {
-        // 有令牌但 runner 不存在 → 明确告知是部署问题，而不是静默失败
+        // 有令牌但**所有启动方式都定位不到** → 明确告知，而不是静默失败。
+        //
+        // 单包模式下默认走自派生（`current_exe()` 在测试进程里总是可用），
+        // 因此必须显式关掉自派生才能触发 RunnerMissing 分支。
         let vault = Arc::new(MemoryVault::new());
         vault.set(&DeviceToken::new("hgd_test".into())).unwrap();
-        let b = bootstrap_with(vault);
+        let b = bootstrap_with(vault).with_self_derive(false);
         match b.ensure_running().await.unwrap() {
             BootstrapOutcome::RunnerMissing { searched } => {
                 assert!(searched.contains("hd-runner-does-not-exist-xyz"));
@@ -324,11 +570,25 @@ mod tests {
     }
 
     #[test]
-    fn self_derive_is_off_by_default() {
-        // 这条是安全/稳定性护栏：自派生在 Windows 上实测崩溃（§3.2.1），
-        // 若有人把默认值改成 true，本测试会立刻失败。
+    fn self_derive_is_on_by_default_for_single_package() {
+        // 单包分发依赖自派生：宿主 exe 通过 `--runner` 拉起自己的第二个进程。
+        //
+        // 历史注记：这里曾经断言 `!allow_self_derive`（护栏），依据是「Windows 上
+        // 自派生必崩 0xC0000139」。后续实测证明该结论只适用于 `windows` 子系统；
+        // `console` 子系统下自派生正常（详见字段文档的对照表），故默认值改为 true。
+        // 若将来有人把子系统改回 `windows`，本测试仍会通过，但运行时自派生会崩 ——
+        // 因此 `main.rs` 里必须保留 console 子系统，那条注释是真正的护栏。
         let vault = Arc::new(MemoryVault::new());
         let b = bootstrap_with(vault);
+        assert!(b.allow_self_derive);
+    }
+
+    #[test]
+    fn self_derive_can_be_disabled_for_debugging() {
+        // 保留关闭能力：排查「是不是自派生导致的问题」时把它关掉，
+        // 退化为同目录独立 runner。
+        let vault = Arc::new(MemoryVault::new());
+        let b = bootstrap_with(vault).with_self_derive(false);
         assert!(!b.allow_self_derive);
     }
 }

@@ -23,9 +23,18 @@ hd-testkit = { path = "../hd-testkit" }
 # 只在测试里手写假 Executor 需要它（生产代码从不 `impl Executor`，故不进依赖区）。
 async-trait = "0.1"
 
-# 同一个 crate 既是 lib（被 hd-host / 测试复用）又是可执行程序（宿主外壳 spawn 它）。
-# 显式声明 [[bin]] 而不是靠 src/main.rs 的默认推导：路径一旦挪动，构建脚本
-# （packaging / hd-testkit 的进程级 e2e）会静默找不到二进制，显式声明能提前暴露。
-[[bin]]
-name = "hd-runner"
-path = "src/main.rs"
+# ## 为什么本 crate 现在**只有 lib，没有 [[bin]]**
+#
+# 历史上这里声明过 `[[bin]] hd-runner`，分发时是「hd-host.exe + hd-runner.exe」两个文件。
+# 现在改为**单包分发**：宿主 `hd-host.exe` 通过 `--runner` 自己拉起自己的第二个进程
+# （见 `hd-host/src/main.rs` 的 `is_runner_mode` 分流），因此不再需要独立的 runner 可执行文件。
+#
+# 判定依据（实测，2026-11）：
+#   - `hd-host.exe --runner` 经 `Stdio::piped()` 由父进程拉起，在 **console 子系统**下
+#     完全正常（子进程进入 main()、读到 stdin、按语义返回退出码 2，耗时约 51ms）；
+#   - 只有把子系统改成 `windows`（无控制台）时才会以 `0xC0000139` 在加载期崩溃。
+#     `hd-host/src/main.rs` 已显式选择 console 子系统，故不受影响。
+#
+# 保留 lib 的理由：`hd-host` 复用了本 crate 的 `ReconnectPolicy`、`ipc::redact_token`、
+# `run_cli` 等逻辑（依赖方向 hd-host → hd-runner，无循环）。
+# 本 crate 不再有 `src/main.rs`，因此无需 `[[bin]]` 声明。

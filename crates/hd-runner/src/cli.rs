@@ -49,10 +49,13 @@ use crate::supervisor::{NoopObserver, Supervisor, WsConnector};
 
 /// 未收到合法 `auth` 首行时的退出码。
 ///
+/// 契约的权威定义在 `hd_protocol::exit_code::EXIT_NO_AUTH`；此处保留同名再导出，
+/// 是为了让 `hd_runner::EXIT_NO_AUTH` 这个既有公开路径不失效（下游已有引用）。
+///
 /// 单独约定一个非 0 值（而不是泛泛的 1）：宿主外壳据此能区分
 /// 「启动协议没谈成（§17.2 E_NO_AUTH，可能是父进程写错了）」与
-/// 「连上后被服务端拒绝（那是业务错误，Runner 会自己重试到放弃）」。
-pub const EXIT_NO_AUTH: u8 = 2;
+/// 「连上后被服务端拒绝（那是业务错误，由 `StopReason::exit_code` 编码）」。
+pub const EXIT_NO_AUTH: u8 = hd_protocol::exit_code::EXIT_NO_AUTH;
 
 /// 宿主下发的运行期信号（由 stdin 读线程转发给主循环）。
 enum ControlSignal {
@@ -99,7 +102,7 @@ where
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("hd-runner: 创建 tokio runtime 失败（{e}），退出");
-            return 1;
+            return hd_protocol::exit_code::EXIT_GENERIC_FAILURE;
         }
     };
     rt.block_on(run_async(dev_mode))
@@ -109,7 +112,11 @@ where
 async fn run_async(dev_mode: bool) -> u8 {
     let mut reader = IpcReader::new(BufReader::new(std::io::stdin()));
 
-    // ① 首行必须是 auth。缺失/超时/格式错 → 非 0 退出（§17.2 E_NO_AUTH）。
+    // ① 首行必须是 auth。缺失/格式错 → EXIT_NO_AUTH（§17.2 E_NO_AUTH）。
+    //
+    // ⚠️ 这里**没有**超时：`read_auth` 是阻塞读，宿主不写就会一直等；若宿主已死
+    // 或未接管道，读到的是 EOF → 立即返回 MissingAuth。历史上本行注释写「缺失/超时」
+    // 但实现中并无 timeout 包装，已更正以免误导排障方向。
     let auth = match reader.read_auth() {
         Ok(a) => a,
         Err(e) => {
@@ -224,8 +231,12 @@ async fn run_async(dev_mode: bool) -> u8 {
     loop {
         tokio::select! {
             reason = sup.run(&mut observer) => {
-                tracing::warn!(reason = %reason, "supervisor 终止，Runner 退出");
-                return 0;
+                // 🔴 必须按原因返回不同退出码：宿主靠它决定「重启 / 不重启 / 清令牌重配对」。
+                // 若统一 return 0，令牌被服务端吊销时宿主无法与「用户主动退出」区分，
+                // 轻则永不恢复，重则变成每秒一次的重启风暴。
+                let code = reason.exit_code();
+                tracing::warn!(reason = %reason, exit_code = code, "supervisor 终止，Runner 退出");
+                return code;
             }
             sig = sig_rx.recv() => {
                 match sig {

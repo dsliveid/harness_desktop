@@ -49,6 +49,10 @@ url = "2"
 # 推导平台配置目录（%APPDATA% / ~/.config），用于存放配对档案。
 # 不用 std::env::current_dir：进程工作目录可能是用户随便点开的位置，甚至只读。
 dirs = "5"
+# 单实例锁（见 src/instance_lock.rs）。rust-version = 1.79，std 的 File::try_lock
+# 尚不可用（1.89 才稳定），故用 fs2 提供 try_lock_exclusive。
+# 必须用 OS 独占锁而不是「读 pid 判活」：pid 会被复用，且进程崩溃后 std 无法自动清理。
+fs2 = "0.4"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",

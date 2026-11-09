@@ -20,9 +20,10 @@ use crate::boot_state::BootUiState;
 use crate::commands::start_pairing_real as core_start_pairing_real;
 use crate::commands::{
     device_status as core_device_status, get_workspace_roots as core_get_workspace_roots,
-    runner_status as core_runner_status, set_workspace_roots as core_set_workspace_roots,
-    start_pairing as core_start_pairing, DeviceStatusResponse, HostState, ListCommandsResponse,
-    RunnerStatusResponse, StartPairingResponse,
+    runner_status as core_runner_status,
+    set_workspace_roots_and_push as core_set_workspace_roots_and_push,
+    start_pairing as core_start_pairing, unpair_device as core_unpair_device, DeviceStatusResponse,
+    HostState, ListCommandsResponse, RunnerStatusResponse, StartPairingResponse,
 };
 
 /// 便于前端统一处理错误：Tauri 的 `Result<_, E>` 要求 `E: Serialize`，
@@ -80,12 +81,24 @@ pub fn get_workspace_roots(state: State<'_, HostState>) -> Vec<String> {
     core_get_workspace_roots(&state)
 }
 
+/// 解除配对（用户主动解约）：停 Runner → 清令牌 → 切到需要配对。
 #[tauri::command]
-pub fn set_workspace_roots(
+pub async fn unpair_device(state: State<'_, HostState>) -> Result<(), String> {
+    core_unpair_device(&state).await.map_err(err_str)
+}
+
+/// 设置工作区白名单，**并下发给执行引擎**。
+///
+/// 必须走 `_and_push` 版本：宿主记了白名单而 Runner 不知道，是改造前最隐蔽的
+/// 安全口径错位（详见 `commands::set_workspace_roots_and_push` 的文档）。
+#[tauri::command]
+pub async fn set_workspace_roots(
     state: State<'_, HostState>,
     roots: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    core_set_workspace_roots(&state, roots).map_err(err_str)
+    core_set_workspace_roots_and_push(&state, roots)
+        .await
+        .map_err(err_str)
 }
 
 /// 配对入口。
@@ -133,7 +146,8 @@ pub fn run() -> tauri::Result<()> {
             set_workspace_roots,
             get_boot_state,
             pair_device,
-            start_pairing
+            start_pairing,
+            unpair_device
         ])
         .setup(|app| {
             // 托盘：关窗后进程继续驻留（桌面端常态）。
@@ -173,15 +187,41 @@ pub fn run() -> tauri::Result<()> {
                 // （回退到 default_ws_url 的 127.0.0.1:5611）。
                 .with_profile_store(std::sync::Arc::new(
                     crate::profile::FileProfileStore::with_default_path(),
-                ));
+                ))
+                // 守护循环重启后要重放工作区白名单：注入取值函数读当前 HostState。
+                //
+                // `State<'_, HostState>` 的生命周期绑定在 setup 回调上，不能直接被
+                // `'static` 闭包捕获。这里在进入守护循环前**先把当前 policy 快照
+                // 克隆出来**：用户后续改设置时会走 `set_workspace_roots_and_push`
+                // 直接下发给运行中的 Runner，因此重启时重放"进入循环那一刻"的快照
+                // 已经覆盖了绝大多数场景（改配置 → 立即下发，无需等重启）。
+                .with_policy_source({
+                    let snapshot = state.policy();
+                    std::sync::Arc::new(move || (*snapshot).clone())
+                });
 
                 let outcome = boot.ensure_running().await;
+                let owns_lock = state.daemon().holds_instance_lock();
                 if let Err(e) = &outcome {
                     tracing::warn!(error = %e, "启动编排失败");
                 }
                 let ui = crate::boot_state::plan_boot(outcome);
                 tracing::info!(state = ?ui.state, detail = %ui.detail, "启动状态已确定");
                 state.set_boot_state(ui);
+
+                // ④ 进入守护循环（需求②）：Runner 意外退出后按退出码契约自动重启。
+                //
+                // 只在「本实例真的拉起了 Runner」时启动：外部实例在跑（owns_lock=false）
+                // 或未配对/启动失败时，本实例不该抢职责（见 Guard::with_lock_ownership）。
+                if owns_lock {
+                    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let mut guard = crate::supervisor::Guard::new(
+                        hd_runner::reconnect::ReconnectPolicy::default(),
+                        std::sync::Arc::clone(&shutdown),
+                    );
+                    let stop = boot.supervise(&mut guard, shutdown).await;
+                    tracing::info!(?stop, "守护循环结束");
+                }
             });
 
             Ok(())

@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::{BootstrapError, BootstrapOutcome};
+use crate::lifecycle::RunnerPhase;
 
 /// 前端可见的启动状态。
 ///
@@ -27,8 +28,17 @@ pub struct BootUiState {
 
 /// 启动状态枚举。
 ///
-/// 刻意包含 `Unknown` 与 `Failed`：启动是异步的，UI 可能在 bootstrap 还没跑完时
-/// 就来读状态。给一个明确的「还不知道」比返回一个假的 `NeedsPairing` 诚实。
+/// ## 与 [`RunnerPhase`] 的关系（重要）
+///
+/// 两者**不是**重复定义，职责严格区分：
+///
+/// - [`RunnerPhase`] 是**全应用唯一事实源**，回答「Runner 现在能不能干活」，
+///   含运行期持续变化的所有相位（backoff / gave_up / externally_running …）；
+/// - `BootStateKind` 只回答「启动编排这一次得出了什么结论」，是一次性的**事件快照**，
+///   由 [`plan_boot`] 从 bootstrap 的返回值投影而来，**不参与运行期状态流转**。
+///
+/// 因此 `BootStateKind` 刻意只有 4 个终态 + 1 个 `Unknown`，不复制 `RunnerPhase` 的
+/// 全部变体 —— 若把它扩成第二个全量状态机，就退回了改造前「三处口径」的老问题。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootStateKind {
@@ -42,6 +52,24 @@ pub enum BootStateKind {
     RunnerMissing,
     /// 启动过程出错。
     Failed,
+}
+
+impl BootStateKind {
+    /// 投影到对应的生命周期相位（供宿主把启动结论写进唯一事实源）。
+    ///
+    /// `Unknown` 映射到 [`RunnerPhase::Idle`]（「还不知道」），
+    /// `RunnerMissing` / `Failed` 映射到 [`RunnerPhase::GaveUp`]
+    /// —— 它们是「没有在跑且不该自动重试」的终态，与用户主动停止不同，
+    /// 但都落在 `GaveUp` 的语义范围内（需用户介入）。
+    #[must_use]
+    pub fn to_phase(&self) -> RunnerPhase {
+        match self {
+            Self::Unknown => RunnerPhase::Idle,
+            Self::NeedsPairing => RunnerPhase::NeedsPairing,
+            Self::Started => RunnerPhase::Running,
+            Self::RunnerMissing | Self::Failed => RunnerPhase::GaveUp,
+        }
+    }
 }
 
 impl BootUiState {
@@ -77,9 +105,19 @@ pub fn plan_boot(outcome: Result<BootstrapOutcome, BootstrapError>) -> BootUiSta
         },
         Ok(BootstrapOutcome::RunnerMissing { searched }) => BootUiState {
             state: BootStateKind::RunnerMissing,
+            // 单包模式下不再让用户「去找第二个文件」——那会把人引向错误的排查方向。
             detail: format!(
-                "缺少执行引擎 hd-runner.exe。请确认它与 hd-host.exe 在同一目录（已查找：{searched}）"
+                "无法启动执行引擎（程序内部异常，非缺少文件）。请重启客户端；若持续出现请联系支持并提供：{searched}"
             ),
+        },
+        Ok(BootstrapOutcome::ExternallyRunning) => BootUiState {
+            // 映射到 `Started`：本机确实在执行任务，用户体验上「能用」。
+            // 但 detail 必须说清本实例只是监护者 —— 否则用户在本窗口改工作区白名单
+            // 却发现「设置成功但不生效」（实际生效的是另一个实例），会以为是 bug。
+            state: BootStateKind::Started,
+            detail: "检测到本机已有执行引擎在运行，本窗口仅做状态监护。\
+                     工作区等配置请在那个实例中修改。"
+                .to_string(),
         },
         // 错误分支保留原始信息：这类问题（密钥链被锁、spawn 失败）用户自己
         // 往往无法解决，需要把原因带给支持人员。
@@ -93,6 +131,20 @@ pub fn plan_boot(outcome: Result<BootstrapOutcome, BootstrapError>) -> BootUiSta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_state_projects_to_lifecycle_phase() {
+        // 启动结论必须能落到唯一事实源里，否则 UI 会出现两套状态。
+        assert_eq!(BootStateKind::Started.to_phase(), RunnerPhase::Running);
+        assert_eq!(
+            BootStateKind::NeedsPairing.to_phase(),
+            RunnerPhase::NeedsPairing
+        );
+        assert_eq!(BootStateKind::Unknown.to_phase(), RunnerPhase::Idle);
+        // 部署/运行失败都是「没在跑且需用户介入」。
+        assert_eq!(BootStateKind::RunnerMissing.to_phase(), RunnerPhase::GaveUp);
+        assert_eq!(BootStateKind::Failed.to_phase(), RunnerPhase::GaveUp);
+    }
 
     #[test]
     fn started_has_no_detail_noise() {
@@ -113,15 +165,26 @@ mod tests {
     }
 
     #[test]
-    fn runner_missing_mentions_files_and_search_path() {
+    fn runner_missing_points_to_internal_fault_not_missing_file() {
         let s = plan_boot(Ok(BootstrapOutcome::RunnerMissing {
-            searched: "同目录 / resources 下的 hd-runner.exe".into(),
+            searched: "current_exe 不可用".into(),
         }));
         assert_eq!(s.state, BootStateKind::RunnerMissing);
-        // 部署问题的提示必须点明「两个文件要在一起」，并带上已搜索路径
-        assert!(s.detail.contains("hd-runner.exe"), "{}", s.detail);
-        assert!(s.detail.contains("同一目录"), "{}", s.detail);
-        assert!(s.detail.contains("已查找"), "{}", s.detail);
+        // 单包模式下不存在「漏拷第二个文件」，文案必须把方向指向程序自身异常，
+        // 否则会把用户引去满盘找 hd-runner.exe（一个已不存在的产物）。
+        assert!(
+            !s.detail.contains("hd-runner.exe"),
+            "文案不该再提已删除的独立可执行文件：{}",
+            s.detail
+        );
+        assert!(
+            !s.detail.contains("同一目录"),
+            "不应再提示把两个文件放一起：{}",
+            s.detail
+        );
+        // 但仍必须带上可操作的下一步与排障信息。
+        assert!(s.detail.contains("重启"), "{}", s.detail);
+        assert!(s.detail.contains("current_exe 不可用"), "{}", s.detail);
     }
 
     #[test]

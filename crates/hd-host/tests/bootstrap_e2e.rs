@@ -178,7 +178,9 @@ async fn ensure_running_after_pairing_restarts_runner() {
     let exe = fake_runner_exe();
     assert!(exe.is_file(), "fake_runner 未构建");
 
-    let daemon = Arc::new(Daemon::new(ReconnectPolicy::default()));
+    let daemon = Arc::new(Daemon::new(ReconnectPolicy::default()).with_lock_path(
+        std::env::temp_dir().join(format!("hd-boot-e2e-a-{}.lock", std::process::id())),
+    ));
     let boot = Bootstrap::new(Arc::clone(&vault), Arc::clone(&daemon), "fake_runner", 1)
         .with_explicit_runner(Some(exe));
 
@@ -199,7 +201,9 @@ async fn ensure_running_is_idempotent() {
     vault.set(&DeviceToken::new("hgd_x".into())).expect("写");
 
     let exe = fake_runner_exe();
-    let daemon = Arc::new(Daemon::new(ReconnectPolicy::default()));
+    let daemon = Arc::new(Daemon::new(ReconnectPolicy::default()).with_lock_path(
+        std::env::temp_dir().join(format!("hd-boot-e2e-b-{}.lock", std::process::id())),
+    ));
     let boot = Bootstrap::new(Arc::clone(&vault), Arc::clone(&daemon), "fake_runner", 1)
         .with_explicit_runner(Some(exe));
 

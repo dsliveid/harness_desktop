@@ -17,11 +17,16 @@
 
 pub mod envelope;
 pub mod error_code;
+pub mod exit_code;
 pub mod payload;
 
 pub use envelope::{
     compatible_version, supported_versions, Envelope, MessageType, ProtocolError,
     CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
+};
+pub use exit_code::{
+    requires_repair, should_restart, ALL as EXIT_CODES, EXIT_GENERIC_FAILURE, EXIT_NO_AUTH,
+    EXIT_OK, EXIT_PROTOCOL_MISMATCH, EXIT_REPLACED, EXIT_RETRYABLE, EXIT_REVOKED,
 };
 pub use payload::{
     Capability, ErrorPayload, HelloPayload, LeaseRevokedPayload, PingPayload, PongPayload,

@@ -30,7 +30,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
@@ -185,33 +184,17 @@ impl LineRing {
 }
 
 /// Runner 生命周期状态（与 `runner_status` command 的 `state` 字段一一对应）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunnerState {
-    /// 尚未启动。
-    Stopped,
-    /// 子进程在跑。
-    Running,
-    /// 子进程已退出，正在退避等待重启。
-    Backoff,
-    /// 连续失败超限，需用户介入（检查 Runner 是否被删/被杀软隔离）。
-    GaveUp,
-    /// 主动停止（用户退出/解除配对），不应自动重启。
-    ShuttingDown,
-}
-
-impl RunnerState {
-    /// 对外字符串形式（前端按此做颜色映射）。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Stopped => "stopped",
-            Self::Running => "running",
-            Self::Backoff => "backoff",
-            Self::GaveUp => "gave_up",
-            Self::ShuttingDown => "shutting_down",
-        }
-    }
-}
+///
+/// ## 为什么这里只是一个别名
+///
+/// 改造前本枚举是**独立定义**的，于是「Runner 处于什么状态」在 `daemon`、
+/// `boot_state`、`commands` 三处各有口径。现在权威定义收敛到
+/// [`crate::lifecycle::RunnerPhase`]，这里保留名字只为**不破坏既有调用方**
+/// （`daemon` 内部与测试仍写 `RunnerState`）。
+///
+/// ⚠️ 新代码请直接用 [`crate::lifecycle::RunnerPhase`]；不要在此扩展变体 ——
+/// 别名上没有自己的定义，任何新增都必须发生在唯一事实源里。
+pub type RunnerState = crate::lifecycle::RunnerPhase;
 
 /// 一次子进程退出的记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,19 +329,19 @@ pub const SELF_DERIVE_FLAG: &str = "--runner";
 
 /// Runner 定位器。
 ///
-/// 优先级刻意如此排列，理由各自不同：
+/// ## 单包模式下的优先级
 ///
-/// ⓪ **自派生**（仅当显式 `allow_self=true`）：宿主自身 + `--runner`。
-///    ⚠️ **Windows 上实测不可用**：链接了 Tauri 的 exe 由父进程经
-///    `Stdio::piped()` 拉起时，会在加载期以 `0xC0000139` 崩溃（stderr 为空，
-///    从未进入 `main()`）；而独立的 hd-runner.exe 走同一条 spawn 路径完全正常。
-///    这是 Tauri 加载期初始化与管道子进程上下文的冲突，不是我们的逻辑缺陷。
-///    因此**默认 `allow_self=false`**，该分支仅保留给非 Windows 平台或未来
-///    改用动态加载 Tauri 后再启用。
-/// ① **显式配置**：允许用户指定自编译的 runner（企业定制/调试）。
-/// ② **同目录独立 runner**：默认路径。既支持单目录分发（两个文件放一起，
-///    用户只点 hd-host.exe），也保留 headless 部署与 `device-e2e` 拉真二进制的
-///    能力。
+/// ⓪ **自派生**（默认，`allow_self=true`）：宿主自身 + `--runner`。
+///    这是**单包分发的主路径** —— 用户只拿到一个 exe，Runner 由它自己派生。
+///
+///    历史误解澄清：旧注释称「Windows 上实测不可用，会在加载期 0xC0000139 崩溃」。
+///    该结论**只在 `windows`（无控制台）子系统下成立**。本仓库实测（2026-11）：
+///    `console` 子系统下自派生正常（子进程进 main()、读 stdin、退出码 2，约 51ms），
+///    详见 `bootstrap::Bootstrap` 字段 `allow_self_derive` 的对照表。
+///
+/// ① **显式配置**：允许指定自编译的 runner（调试 / 特殊排查）。
+/// ② **同目录独立 runner**：兜底。保留给「开发期单独编了 runner」与历史部署形态；
+///    正常分发不再需要它。
 pub fn locate_runner(
     explicit: Option<&Path>,
     exe_name: &str,
@@ -366,7 +349,7 @@ pub fn locate_runner(
 ) -> Option<RunnerLaunch> {
     let current = std::env::current_exe().ok();
 
-    // ⓪ 自派生：宿主自己就是 Runner（见上文关于 Windows 限制的说明）。
+    // ⓪ 自派生：宿主自己就是 Runner（单包分发主路径）。
     if allow_self {
         if let Some(me) = current.as_ref() {
             if me.is_file() {
@@ -421,6 +404,30 @@ pub struct Daemon {
     last_exit: Mutex<Option<ExitRecord>>,
     /// 当前运行的子进程（`spawn` 后为 `Some`）。
     running: AsyncMutex<Option<RunningChild>>,
+    /// 本机实例锁（`Some` == 本进程负责拉起 Runner）。
+    ///
+    /// ## 为什么放在 Daemon 里，而不是 Bootstrap 的局部变量
+    ///
+    /// 锁的生命周期必须**覆盖 Runner 的整个运行期**：`Bootstrap::ensure_running`
+    /// 一返回，局部变量就会被 drop。若锁留在局部变量里，函数退出即释放锁，
+    /// 下一个宿主进程会立刻抢到锁并误判「本机没人在跑」，再 spawn 一份 ——
+    /// 正好是这把锁要防的双开。
+    ///
+    /// 放在 Daemon 的理由：Daemon 就是「Runner 的存在期」这个概念的载体，
+    /// 它在 `shutdown()` 里统一释放锁，语义自然对齐（Runner 停 ⇒ 职责结束 ⇒ 交还锁）。
+    ///
+    /// 用 std `Mutex` 而非 async：临界区只有取/放一个 `Option`，没有 `.await`。
+    instance_lock: Mutex<Option<crate::instance_lock::InstanceLock>>,
+    /// 锁文件路径覆盖（`None` == 用 [`InstanceLock::default_path`]）。
+    ///
+    /// ## 为什么必须可注入
+    ///
+    /// 测试并行跑时，同一个进程内的多个用例会共享默认锁路径（都指向用户数据目录），
+    /// 于是「A 抢到锁、B 抢不到」变成**测试之间的干扰**而不是被验证的行为 ——
+    /// 表现为随机失败，且与真实缺陷难以区分。
+    ///
+    /// 生产环境保持 `None`；测试用 `Daemon::with_lock_path` 注入 tempdir 路径。
+    lock_path: Option<PathBuf>,
 }
 
 struct RunningChild {
@@ -437,7 +444,63 @@ impl Daemon {
             logs: Arc::new(Mutex::new(LineRing::new(LOG_RING_CAPACITY))),
             last_exit: Mutex::new(None),
             running: AsyncMutex::new(None),
+            instance_lock: Mutex::new(None),
+            lock_path: None,
         }
+    }
+
+    /// 指定实例锁文件路径（**仅测试用**；生产走 `InstanceLock::default_path`）。
+    ///
+    /// 见字段 `lock_path` 的文档：不注入会让并行测试互相抢同一把锁。
+    #[must_use]
+    pub fn with_lock_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.lock_path = Some(path.into());
+        self
+    }
+
+    /// 尝试抢占本机实例锁，抢到则**由本 Daemon 长期持有**。
+    ///
+    /// - `Ok(true)`：抢到（本机此前没人在负责 Runner）；
+    /// - `Ok(false)`：已被别的进程持有 —— 调用方不得 spawn；
+    /// - `Err`：锁文件不可用（权限/磁盘），按启动失败处理。
+    ///
+    /// 已持有则直接返回 `true`（幂等）：`ensure_running` 可能被调用多次，
+    /// 重复抢同一把锁会因「自己持有」而返回 false，把自己误判成外部实例。
+    pub fn acquire_instance_lock(&self) -> std::io::Result<bool> {
+        let mut guard = self.instance_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(true);
+        }
+        let path = match &self.lock_path {
+            Some(p) => p.clone(),
+            None => crate::instance_lock::InstanceLock::default_path()?,
+        };
+        match crate::instance_lock::InstanceLock::try_acquire(&path)? {
+            Some(lock) => {
+                tracing::debug!(path = %lock.path().display(), "已取得本机实例锁");
+                *guard = Some(lock);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// 释放本机实例锁（Runner 已停止 / 拉起失败回滚时调用）。
+    ///
+    /// 释放后本机即可由另一个宿主实例接管，因此**只应在真的不再负责 Runner 时调用**。
+    pub fn release_instance_lock(&self) {
+        let mut guard = self.instance_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.take().is_some() {
+            tracing::debug!("本机实例锁已交还");
+        }
+    }
+
+    /// 当前是否持有本机实例锁（诊断用）。
+    pub fn holds_instance_lock(&self) -> bool {
+        self.instance_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// 共享统计句柄（给 command 层读状态）。
@@ -649,6 +712,9 @@ impl Daemon {
     }
 
     /// 主动停止：关闭写端让子进程自杀，并标记为 `ShuttingDown`（不自动重启）。
+    ///
+    /// **同时交还本机实例锁**：Runner 一停，本进程就不再是「负责 Runner 的那一个」，
+    /// 锁继续持有会让本机其他实例（或用户重启后的新实例）无法接管。
     pub async fn shutdown(&self) {
         self.stats.set_state(RunnerState::ShuttingDown);
         let mut guard = self.running.lock().await;
@@ -665,6 +731,10 @@ impl Daemon {
             }
         }
         *guard = None;
+        // 子进程已确定停止，交还锁。放在 `*guard = None` 之后：
+        // 若先放锁再等子进程退出，另一个实例可能抢到锁并孙 spawn 出第二份 Runner，
+        // 与本实例尚未退出的子进程撞上（双开）。
+        self.release_instance_lock();
     }
 
     fn shared_sink(&self) -> Arc<LogSink> {

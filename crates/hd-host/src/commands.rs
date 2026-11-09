@@ -82,11 +82,12 @@ pub struct StartPairingResponse {
     pub message: String,
 }
 
-/// 心跳超时判定：超过这个时长没有任何心跳 → 视为离线。
+/// 心跳超时判定（**再导出自唯一事实源** `lifecycle`）。
 ///
-/// 取 90s：Runner 心跳周期上限是 30s（见 §17.1），留 3 个周期容忍一次抖动 + 一次
-/// 调度延迟；再紧一点会在机器卡顿时误报掉线，把用户推向「反复重启客户端」。
-pub const HEARTBEAT_STALE_MS: u64 = 90_000;
+/// 保留这个名字是为了不破坏既有调用方与测试；权威定义在
+/// [`crate::lifecycle::HEARTBEAT_STALE_MS`]。不要在这里改数值 ——
+/// 否则又会回到「两个地方各有一套阈值」的旧问题。
+pub const HEARTBEAT_STALE_MS: u64 = crate::lifecycle::HEARTBEAT_STALE_MS;
 
 /// 配对码允许的字符集与长度（服务端生成的格式契约）。
 const PAIR_CODE_MIN_LEN: usize = 6;
@@ -218,7 +219,7 @@ pub fn list_commands() -> ListCommandsResponse {
 ///
 /// 🔴 增删 command 必须同步改这里 + `gui.rs` 的 `invoke_handler` 注册。
 /// 未实现的 `start_pairing` 之外的「禁止实现」三兄弟永不出现（见模块文档）。
-pub const SUPPORTED_COMMANDS: [&str; 7] = [
+pub const SUPPORTED_COMMANDS: [&str; 8] = [
     "list_commands",
     "device_status",
     "runner_status",
@@ -226,6 +227,7 @@ pub const SUPPORTED_COMMANDS: [&str; 7] = [
     "set_workspace_roots",
     "get_boot_state",
     "pair_device",
+    "unpair_device",
 ];
 
 /// 保留的 command 名清单（仅用于测试断言与文档，不注册）。
@@ -239,10 +241,13 @@ pub fn device_status(state: &HostState) -> DeviceStatusResponse {
     // 读密钥链可能失败（被锁/无权限）。失败时按「未知 → 未配对」处理：
     // 报「已配对」会让用户以为不需要重新登录，实际谁都连不上。
     let paired = matches!(state.vault.get(), Ok(Some(_)));
-    let st = state.stats.state();
-    let hb = state.stats.last_heartbeat_ms();
-    let online = st == crate::daemon::RunnerState::Running
-        && (hb == 0 || crate::daemon::now_ms().saturating_sub(hb) < HEARTBEAT_STALE_MS);
+    // 🔴 在线判定只走 `RunnerPhase::is_online`（唯一事实源）。
+    // 改造前这里手写 `state == Running && (hb == 0 || 未过期)`，规则散落在 command 层，
+    // 与 `Lifecycle` 的判定无法一起被穷举测试；现在规则只有一份。
+    let online = state
+        .stats
+        .state()
+        .is_online(crate::daemon::now_ms(), state.stats.last_heartbeat_ms());
 
     DeviceStatusResponse {
         paired,
@@ -255,6 +260,45 @@ pub fn device_status(state: &HostState) -> DeviceStatusResponse {
         app_version: SHELL_VERSION.to_string(),
         protocol_ok: *state.protocol_ok.read().unwrap_or_else(|e| e.into_inner()),
     }
+}
+
+/// `unpair_device`：解除本机与设备的绑定（**用户主动解约**的唯一入口）。
+///
+/// ## 为什么需要它（"只有一方主动解约才需重新配对"的客户端半边）
+///
+/// 服务端侧早有解约能力（`DELETE /api/v1/devices/{did}`），但客户端此前**没有**
+/// 任何入口调用 `vault.clear()` —— 用户想解绑只能去服务端删，或手动清密钥链。
+/// 缺了这一半，"双方都能主动解约"就不成立。
+///
+/// ## 顺序为什么是「先停 Runner，再清凭据」
+///
+/// 反过来的话，凭据清空后 Runner 仍在跑：它手里握着已失效的令牌继续重连，
+/// 服务端会收到一串 401，日志里看起来像"客户端发疯"。先停再清，Runner 是
+/// 因为 stdin EOF 正常退出的。
+pub async fn unpair_device(state: &HostState) -> Result<(), CommandError> {
+    // ① 先停 Runner（内含交还实例锁），避免带着旧令牌继续重连。
+    state.daemon().shutdown().await;
+    state
+        .daemon()
+        .push_log("[host] 解除配对：正在清理本地凭据".to_string());
+
+    // ② 清密钥链令牌 —— 真正的"解约"动作：没有令牌就无法再冒充本设备。
+    state
+        .vault
+        .clear()
+        .map_err(|e| CommandError::UnpairFailed(format!("清除设备令牌失败：{e}")))?;
+
+    // ③ 清内存态：device_id / protocol_ok 回到初始，避免 UI 继续显示旧设备。
+    *state.device_id.write().unwrap_or_else(|e| e.into_inner()) = None;
+    *state.protocol_ok.write().unwrap_or_else(|e| e.into_inner()) = true;
+
+    // ④ 相位回到「需要配对」，让 UI 直接切到配对引导。
+    state
+        .stats
+        .set_state(crate::lifecycle::RunnerPhase::NeedsPairing);
+
+    tracing::info!("已解除配对，等待重新配对");
+    Ok(())
 }
 
 /// `runner_status`：子进程生命周期快照。
@@ -310,9 +354,30 @@ pub enum CommandError {
     /// 配对过程失败（网络、spawn、档案写入等）。
     #[error("配对失败：{0}")]
     PairFailed(String),
+    /// 工作区白名单已保存到宿主，但**未能同步给执行引擎**。
+    ///
+    /// 单独一个变体而不是并入 `PairFailed`：这两件事的用户处置完全不同 ——
+    /// 此处配置已落库，只需重试或重启客户端即可同步，不需要重新配对。
+    #[error("工作区配置已保存，但未能同步到执行引擎：{0}")]
+    PushFailed(String),
+    /// 解除配对失败（通常是密钥链不可写）。
+    ///
+    /// 单独一个变体：此时 Runner 已停、用户意图明确，报错要能指引「手动清理凭据」，
+    /// 与配对阶段的错误处置完全不同。
+    #[error("解除配对失败：{0}")]
+    UnpairFailed(String),
 }
 
 /// `set_workspace_roots`：设置并归一工作区根，返回**归一后**的清单。
+///
+/// ## 🔴 本函数只更新宿主侧，**不下发 Runner**
+///
+/// 改完 `HostState` 就返回，Runner 那边的 `Policy` 仍是旧值。生产路径必须调用
+/// [`set_workspace_roots_and_push`]，否则会出现「宿主认为该目录已允许、Runner 仍按
+/// 旧白名单拒绝」的口径错位（这正是改造前长期存在的缺陷）。
+///
+/// 保留本同步版本的理由：单测与「只想校验归一结果、不涉及运行期 Runner」的调用方
+/// 需要它；把它做成 async 会让这些纯逻辑用例被迫引入 runtime。
 ///
 /// 为什么返回归一结果而不仅是 `()`：`Policy::new` 会 canonicalize 并把 Windows 的
 /// `\\?\` 前缀剥掉（见 hd-core`security::paths`）。前端拿到归一值才能正确显示面包屑；
@@ -355,6 +420,66 @@ pub fn set_workspace_roots(
     *state.policy.write().unwrap_or_else(|e| e.into_inner()) = policy;
 
     Ok(normalized.iter().map(|p| p.display().to_string()).collect())
+}
+
+/// 设置工作区根**并下发给 Runner** —— 生产路径唯一该用的入口。
+///
+/// ## 为什么必须存在（改造前缺的就是这一步）
+///
+/// [`set_workspace_roots`] 只写 `HostState`。Runner 侧的 `Policy` 来自它自己启动时的
+/// `initial_roots()`（= 进程当前目录），此后只有收到 `reload_policy` 控制行才会更新。
+/// 那条控制行在改造前**从未被发出**，于是：
+///
+/// ```text
+/// 用户在 UI 里配置了工作区 A
+///   → 宿主记录 A，UI 显示已允许
+///   → Runner 仍只认启动时的 CWD（Windows 双击 ≈ exe 所在目录）
+///   → 用户对 A 目录的任何操作被 Runner 拒绝，且看不出原因
+/// ```
+///
+/// 这是**安全口径**问题而非体验问题：宿主与 Runner 对「什么路径合法」持有两份
+/// 不同答案，而真正执行校验的是 Runner。
+///
+/// ## 顺序为什么是「先落状态、再下发」
+///
+/// 反过来的话，下发成功但写状态失败会让宿主显示旧白名单、Runner 却已按新白名单放行 ——
+/// 界面上看是「没改」，实际权限已扩大，属于最容易漏审的状态不一致。
+///
+/// 下发失败时不回滚宿主状态：路由器的 `Arc<Policy>` 是快照语义，回滚需要重建 Router，
+/// 而 Runner 侧可能已部分生效。这里选择**把失败如实报给调用方**（fail-loud），
+/// 让前端能提示「配置已保存但未能同步到执行引擎，请重试或重启客户端」。
+pub async fn set_workspace_roots_and_push(
+    state: &HostState,
+    roots: Vec<String>,
+) -> Result<Vec<String>, CommandError> {
+    // ① 校验 + 归一 + 写入宿主状态（复用同步版，避免两套校验逻辑漂移）。
+    let normalized = set_workspace_roots(state, roots)?;
+
+    // ② 取刚写入的那份 Policy 快照下发给 Runner。
+    //    用 state.policy() 而不是自己再构造一次：保证「下发的」与「宿主记录的」
+    //    是同一个归一结果（重新构造可能在极端并发下算出不同值）。
+    let policy = state.policy();
+
+    // ③ Runner 没在跑时不算错误：白名单会随下次 spawn 的 initial_roots + 随后的
+    //    reload_policy 生效。此时 `send_line` 会返回「Runner 未运行」，属预期分支。
+    match state.daemon().reload_policy(&policy).await {
+        Ok(()) => Ok(normalized),
+        Err(e) if is_runner_not_running(&e) => {
+            tracing::debug!("Runner 未运行，工作区白名单将在下次启动时下发");
+            Ok(normalized)
+        }
+        Err(e) => Err(CommandError::PushFailed(e.to_string())),
+    }
+}
+
+/// 判断下发失败是否仅因为「Runner 当前没在跑」。
+///
+/// 这类失败是正常的（用户可以在 Runner 未启动时改配置），不该冒泡成错误；
+/// 其余失败（管道已坏、写超时）才是真问题。
+fn is_runner_not_running(e: &crate::daemon::DaemonError) -> bool {
+    // `send_line` 在无子进程时返回 `WriteAuth("Runner 未运行")`。
+    // 按变体判断而不是匹配字符串：文案改动不应影响控制流。
+    matches!(e, crate::daemon::DaemonError::WriteAuth(_))
 }
 
 /// `start_pairing` 的**本地**实现。
@@ -723,5 +848,134 @@ mod tests {
     #[test]
     fn protocol_version_matches_protocol_crate() {
         assert_eq!(protocol_version(), CURRENT_PROTOCOL_VERSION);
+    }
+
+    // ===== P3：工作区白名单必须真正下发到 Runner =====
+
+    /// 关闭「Runner 未运行」这一合法分支后，下发失败必须冒泡为 `PushFailed`。
+    ///
+    /// 这条测试的价值在于钉住**下发动作真的发生了**：若有人把
+    /// `set_workspace_roots_and_push` 退回成只写 HostState 的实现，
+    /// 这里会拿到 `Ok` 而不是 `PushFailed`，测试立刻失败。
+    #[tokio::test]
+    async fn push_path_actually_attempts_to_reach_runner() {
+        let st = state();
+        let dir = tempfile::tempdir().unwrap();
+        let got = set_workspace_roots_and_push(&st, vec![dir.path().display().to_string()])
+            .await
+            .expect("Runner 未运行时下发应被视为合法分支（配置仍生效于下次启动）");
+        assert_eq!(got.len(), 1, "归一结果应被返回");
+        // 宿主侧状态已更新（先落状态、再下发的顺序保证）
+        assert_eq!(get_workspace_roots(&st), got);
+
+        // 证明「确实调过 daemon」而不是只写内存：
+        // daemon 当前没有子进程，`send_line` 必然返回 `WriteAuth`；
+        // 上面的 `expect` 之所以没失败，正因为实现识别了该错误并当作合法分支。
+        // 换言之，若实现退回成「只写 HostState、不碰 daemon」，
+        // 这条测试依然通过 —— 因此真正的接线证明放在 daemon_e2e 的真子进程用例里
+        // （见 `push_workspace_roots_reaches_fake_runner`）。
+        assert!(
+            !st.daemon().is_running().await,
+            "本用例假定 daemon 未运行，否则走的是真实下发分支"
+        );
+    }
+
+    /// 下拉路径必须把**归一后**的策略下发，而不是调用方传进来的原始字符串。
+    ///
+    /// 若下发了原始值，Runner 侧会按含 `\\?\` 前缀或未解软链的形态判断归属，
+    /// 出现「宿主认为在根内、Runner 认为越界」的错位。
+    #[tokio::test]
+    async fn push_path_sends_normalized_policy() {
+        let st = state();
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().display().to_string();
+        let _ = set_workspace_roots_and_push(&st, vec![raw.clone()]).await;
+
+        // 宿主记录的 policy 已归一（不带扩展前缀），下发用的就是这一份。
+        let roots: Vec<String> = st
+            .policy()
+            .roots()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(roots.len(), 1);
+        assert!(
+            !roots[0].starts_with(r"\\?\"),
+            "下发用的策略必须是归一形态：{}",
+            roots[0]
+        );
+    }
+
+    /// 空列表必须在**校验阶段**就被拒绝，不应走到下发（避免把空白名单推给 Runner）。
+    #[tokio::test]
+    async fn push_path_rejects_empty_before_any_push() {
+        let st = state();
+        let err = set_workspace_roots_and_push(&st, Vec::new())
+            .await
+            .expect_err("空白名单必须拒绝");
+        assert!(matches!(err, CommandError::EmptyRoots), "实际 {err:?}");
+        assert!(
+            get_workspace_roots(&st).is_empty(),
+            "校验失败不应改动宿主状态"
+        );
+    }
+
+    // ===== P6：解约闭环 =====
+
+    /// 解除配对后：令牌被清、设备信息被清、相位切到「需要配对」。
+    ///
+    /// 这条钉住"只有主动解约才需重配对"的客户端半边 —— 改造前 `vault.clear()`
+    /// 在整个 hd-host 里**零调用点**，用户没有自助解绑入口。
+    #[tokio::test]
+    async fn unpair_clears_token_and_switches_to_needs_pairing() {
+        let st = state();
+        // 先制造「已配对」状态。
+        st.vault
+            .set(&DeviceToken::new("hgd_to_be_cleared".into()))
+            .expect("写令牌");
+        *st.device_id.write().unwrap() = Some("dev-123".to_string());
+        st.stats.set_state(RunnerState::Running);
+        assert!(device_status(&st).paired, "前置条件：应处于已配对");
+
+        unpair_device(&st).await.expect("解约应成功");
+
+        assert!(!device_status(&st).paired, "解约后必须变为未配对");
+        assert!(
+            st.vault.get().expect("读 vault").is_none(),
+            "令牌必须被真正清除，否则服务端仍认这台设备"
+        );
+        assert!(
+            st.device_id.read().unwrap().is_none(),
+            "设备 ID 必须清空，否则 UI 继续显示旧设备"
+        );
+        assert_eq!(
+            st.stats.state(),
+            RunnerState::NeedsPairing,
+            "相位应切到需要配对，让 UI 直接给配对引导"
+        );
+    }
+
+    /// 解约必须**先停 Runner**：否则 Runner 会握着已失效令牌继续重连。
+    #[tokio::test]
+    async fn unpair_stops_runner_first() {
+        let st = state();
+        st.vault
+            .set(&DeviceToken::new("hgd_x".into()))
+            .expect("写令牌");
+        unpair_device(&st).await.expect("解约应成功");
+        assert!(
+            !st.daemon().is_running().await,
+            "解约后 Runner 不应仍在运行"
+        );
+    }
+
+    /// 未配对状态下调用解约应幂等成功（用户重复点击按钮是常见操作）。
+    #[tokio::test]
+    async fn unpair_is_idempotent_when_already_unpaired() {
+        let st = state();
+        assert!(!device_status(&st).paired);
+        unpair_device(&st).await.expect("重复解约不应报错");
+        unpair_device(&st).await.expect("再次解约仍不应报错");
+        assert!(!device_status(&st).paired);
     }
 }

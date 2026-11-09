@@ -11,6 +11,39 @@ AI Agent 系统的**桌面端重执行工位**（Tauri 2 + Rust）。
 
 ---
 
+## 项目进度与下一步
+
+**进度快照详见设计文档 §20；下一步计划见 §21。** 此处只放速查表。
+
+| 阶段 | 内容 | 状态 |
+| --- | --- | --- |
+| P0 | 单包分发收口（只发一个 `hd-host.exe`） | ✅ |
+| P1 | 退出码契约（`hd-protocol::exit_code`） | ✅ |
+| P2 | 生命周期状态收口（`lifecycle.rs` 为唯一事实源） | ✅ |
+| P3 | 修通 `reload_policy`（白名单真正下发到执行引擎） | ✅ |
+| P4 | 单实例锁（不重复拉起 Runner） | ✅ |
+| P5 | 守护循环（Runner 宕机自动拉起） | ✅ |
+| P6 | 解约闭环（`unpair_device`） | ✅ |
+| P9 | Go 侧 `device-e2e` 适配单包 | ✅ |
+| **P7** | **UI 状态透出**（后端已就绪，纯前端） | ⬜ 待做 |
+| **P8** | **前端 devUrl 热更**（可选，开发体验） | ⬜ 待做 |
+
+**最近一次全量门禁**：`cargo test --workspace` 284 通过 / 0 失败；
+`fmt` 与 `clippy --workspace --all-targets` 干净；
+`cargo build -p hd-host --features gui` 通过。
+
+**下一步（按优先级）**：
+
+1. **P7 UI 状态透出** —— 后端能力已全部实现但前端未消费：
+   `tauriBridge.ts` 需加 `unpair_device` 调用与「解除配对」入口；
+   `runner_status.state` 新增的三个值（`idle` / `needs_pairing` / `externally_running`）
+   需要前端颜色映射覆盖，否则会落到默认分支。
+2. **P8 前端热更**（可选）—— 开发态用 Tauri `devUrl` 指向 vite，免去 build + sync-web。
+3. **待观察项**（不影响当前功能）：`mark_heartbeat` 仍无生产调用点，
+   `device_status.online` 走「未收到心跳视为在线」的乐观分支（详见设计文档 §21.3）。
+
+---
+
 ## Crate 结构
 
 | Crate | 职责 | 关键红线 |
@@ -91,21 +124,40 @@ cd web && npm ci && npm run build && cd ..
 产物：
 
 ```
-target\release\hd-host.exe     桌面宿主（UI 已嵌入），用户双击这个
-target\release\hd-runner.exe   执行引擎，由宿主自动拉起，用户无需关心
+target\release\hd-host.exe     唯一分发文件。GUI 宿主 + 内置执行引擎
 ```
 
 > ⚠️ 首次 `release` 构建要跑 LTO，可能耗时数分钟。若命令超时被中断，
 > 重新执行一次即可（增量续建）。
 
-### 为什么有两个 exe
+### 单包分发：一个文件，两个进程
 
-分发时两个文件放同一目录，**用户只启动 `hd-host.exe`**，第二个文件对其透明。
+**用户只拿到 `hd-host.exe` 一个文件。** 它在配对完成后用 `--runner` 参数
+**拉起自己的第二个进程**作为执行引擎：
 
-曾尝试合并为单文件自派生（`hd-host.exe --runner`），在 Windows 上实测失败：
-链接了 Tauri 的 exe 被父进程经 `Stdio::piped()` 拉起时会在加载期崩溃
-（`0xC0000139`，stderr 为空，从未进入 `main()`），而独立 `hd-runner.exe`
-走同一 spawn 路径完全正常。详见设计文档 §3.2.1。
+```
+hd-host.exe           → GUI / 守护进程（窗口、令牌、生命周期）
+hd-host.exe --runner  → 风险执行进程（无窗口，跑命令/动文件）
+```
+
+文件数量 1（runner 代码静态链接进同一 exe），进程数量 2（执行面必须与界面隔离）。
+详见设计文档 §2。
+
+> 🔴 **历史误解澄清**：README 旧版曾写「自派生在 Windows 上实测失败（`0xC0000139`）」。
+> 2026-11 用真实 spawn 探针复测证明：**该结论只适用于 `windows` 子系统**；
+> 本项目采用的 `console` 子系统下自派生完全正常（进入 `main()`、读 stdin、
+> 退出码 2，约 51ms）。代价是 GUI 双击时闪一下控制台窗口，已确认接受。
+> 详见设计文档 §2.4。
+
+### 开发联调（不必关心「编两个包」）
+
+```powershell
+.\scripts\dev.ps1              # 构建 + 启动
+.\scripts\dev.ps1 -NoLaunch    # 只构建（IDE 调试前）
+.\scripts\dev.ps1 -WithWeb     # 连前端一起重建
+```
+
+单包后不再存在「改了 runner 却跑旧 exe」的静默错配问题。详见设计文档 §2.5。
 
 ---
 
@@ -171,9 +223,9 @@ cd web && npm ci && npm run build && cd ..
    │
    └─ 后台异步执行启动编排
         ├─ 密钥链有令牌？
-        │    ├─ 是 → 读 profile.json 拿 ws_url → 拉起 hd-runner → 设备上线
+        │    ├─ 是 → 读 profile.json 拿 ws_url → 自派生 --runner → 设备上线
         │    └─ 否 → 状态=NeedsPairing，UI 显示配对引导
-        └─ 找不到 hd-runner.exe → 状态=RunnerMissing（提示两个文件要放一起）
+        └─ 连自派生都拿不到 current_exe → 状态=RunnerMissing（程序自身异常）
 ```
 
 前端通过 `get_boot_state` command 读取当前启动状态，据 `state` 字段决定显示哪块 UI：
@@ -183,8 +235,11 @@ cd web && npm ci && npm run build && cd ..
 | `unknown` | 启动流程还没跑完 | 稍候 |
 | `needs_pairing` | 密钥链无令牌 | 输入配对码 |
 | `started` | Runner 已拉起 | 无需操作 |
-| `runner_missing` | 缺少 hd-runner.exe | 确认两个文件在同一目录 |
+| `runner_missing` | 无法启动执行引擎（程序内部异常） | 重启客户端；持续出现则联系支持 |
 | `failed` | 启动出错 | 看 `detail` 里的原因 |
+
+> 注：单包分发下不再存在「漏拷第二个文件」这种情况，故 `runner_missing`
+> 的文案已改为指向程序自身异常，避免把用户引去找一个不存在的 `hd-runner.exe`。
 
 配对流程（`pair_device` command，**异步**）：
 
@@ -207,14 +262,18 @@ cd web && npm ci && npm run build && cd ..
 | --- | --- |
 | `list_commands` | 能力探测（锚点） |
 | `device_status` | 设备/配对状态 |
-| `runner_status` | 子进程生命周期快照 |
+| `runner_status` | 子进程生命周期快照（含 `restarts`、`last_heartbeat_ms`） |
 | `get_boot_state` | 启动流程走到哪一步 |
-| `get_workspace_roots` / `set_workspace_roots` | 工作区白名单读写 |
+| `get_workspace_roots` / `set_workspace_roots` | 工作区白名单读写（写路径会**同步下发**给执行引擎） |
 | `pair_device` | 真实配对（异步） |
+| `unpair_device` | 解除配对：停 Runner → 清令牌 → 切「需要配对」 |
 
 🔴 **永不实现**（写死在 `FORBIDDEN_COMMANDS`，有单测断言）：`get_device_token` /
 `raw_ws_send` / `exec_shell`。远程 UI 握有 `invoke` 权限，这三条一旦存在，
 「服务端被攻破也不会丢令牌」的保证就没了。
+
+> `start_pairing` 也注册在 `invoke_handler` 里（便于前端联调），但**刻意不列入**
+> `SUPPORTED_COMMANDS`：它只做本地校验与排队，宣称「支持」会让 UI 显示一个必然失败的功能。
 
 ---
 
@@ -249,8 +308,11 @@ Stop-Process -Id $p.Id -Force
 ```bash
 cd ../harness_go
 go run ./cmd/device-e2e                 # 自包含：进程内起真实 Router+Gateway+临时 sqlite
-go run ./cmd/device-e2e -mode runner    # 拉起真实 hd-runner.exe 做两端对撞
+go run ./cmd/device-e2e -mode runner    # 拉起 hd-host.exe --runner 做两端对撞
 ```
+
+> `-mode runner` 拉的是 `hd-host.exe --runner`（单包分发后没有独立的
+> `hd-runner.exe`）。若该脚本仍硬编码旧路径，需同步调整——属于待办项。
 
 输出 `PASS n / FAIL 0` 即表示「配对 → WS → 心跳 → 派发 → 回执」全链通过。
 

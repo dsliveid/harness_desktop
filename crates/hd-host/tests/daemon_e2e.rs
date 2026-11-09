@@ -291,3 +291,43 @@ async fn wait_exit_records_exit_code() {
     assert_eq!(d.last_exit(), Some(rec));
     assert!(!d.is_running().await);
 }
+
+/// P3 接线证明：`set_workspace_roots_and_push` 必须真的把 `reload_policy`
+/// 写进 Runner 的 stdin。
+///
+/// ## 为什么必须用真子进程
+///
+/// 这是「宿主与 Runner 的白名单口径是否一致」的唯一可观测证据。改造前的缺陷
+/// 恰恰是**代码看起来一切正常**：HostState 更新了、UI 显示成功，只是那条控制行
+/// 从未发出。用 mock 无法发现这种「漏了一次 IO」的缺陷 —— 只有真管道 + 真子进程
+/// 打出的 `op` 才能证明字节确实过去了。
+///
+/// 假 Runner 会把每行的 `op` 打到 stdout，宿主经 `pump_lines` 收进日志 ring，
+/// 因此断言日志里出现 `op=reload_policy` 即为端到端证据。
+#[tokio::test]
+async fn push_workspace_roots_reaches_fake_runner() {
+    let d = daemon();
+    let launch = RunnerLaunch::standalone(fake_runner_exe());
+
+    d.spawn(&launch, &token("hgd_push_test"), "ws://127.0.0.1:1/x", 1)
+        .await
+        .expect("拉起 Runner");
+
+    let d_ref = &d;
+    let started = wait_until(|| d_ref.logs().iter().any(|l| l.contains("auth token_len="))).await;
+    assert!(started, "子进程未启动：{:?}", d.logs());
+
+    // 下发一份工作区白名单。
+    let policy = hd_core::security::guard::Policy::new(vec![std::env::temp_dir()], Vec::new());
+    d.reload_policy(&policy).await.expect("下发应成功");
+
+    // 子进程收到并把它打到 stdout → 经 pump_lines 进日志 ring。
+    let seen = wait_until(|| d_ref.logs().iter().any(|l| l.contains("op=reload_policy"))).await;
+    assert!(
+        seen,
+        "Runner 未收到 reload_policy —— 白名单下发链路断开（宿主已改、执行侧不知道）。日志：{:?}",
+        d.logs()
+    );
+
+    let _ = d.shutdown().await;
+}
