@@ -25,21 +25,16 @@ AI Agent 系统的**桌面端重执行工位**（Tauri 2 + Rust）。
 | P5 | 守护循环（Runner 宕机自动拉起） | ✅ |
 | P6 | 解约闭环（`unpair_device`） | ✅ |
 | P9 | Go 侧 `device-e2e` 适配单包 | ✅ |
-| **P7** | **UI 状态透出**（后端已就绪，纯前端） | ⬜ 待做 |
+| **P7** | **UI 状态透出**（执行引擎状态卡 + 解除配对入口） | ✅ |
 | **P8** | **前端 devUrl 热更**（可选，开发体验） | ⬜ 待做 |
 
-**最近一次全量门禁**：`cargo test --workspace` 284 通过 / 0 失败；
-`fmt` 与 `clippy --workspace --all-targets` 干净；
-`cargo build -p hd-host --features gui` 通过。
+**最近一次全量门禁**：后端 `cargo test` 分包跑全绿（`hd-host` 109 + e2e 14 + 其余）；
+前端 `npx tsc --noEmit` 通过、`npm test` **31 通过 / 0 失败**、产物 15.7 KB（预算 614 KB）。
 
 **下一步（按优先级）**：
 
-1. **P7 UI 状态透出** —— 后端能力已全部实现但前端未消费：
-   `tauriBridge.ts` 需加 `unpair_device` 调用与「解除配对」入口；
-   `runner_status.state` 新增的三个值（`idle` / `needs_pairing` / `externally_running`）
-   需要前端颜色映射覆盖，否则会落到默认分支。
-2. **P8 前端热更**（可选）—— 开发态用 Tauri `devUrl` 指向 vite，免去 build + sync-web。
-3. **待观察项**（不影响当前功能）：`mark_heartbeat` 仍无生产调用点，
+1. **P8 前端热更**（可选）—— 开发态用 Tauri `devUrl` 指向 vite，免去 build + sync-web。
+2. **待观察项**（不影响当前功能）：`mark_heartbeat` 仍无生产调用点，
    `device_status.online` 走「未收到心跳视为在线」的乐观分支（详见设计文档 §21.3）。
 
 ---

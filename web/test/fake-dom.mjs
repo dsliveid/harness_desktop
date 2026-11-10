@@ -101,6 +101,8 @@ export function createDocument() {
     return sec
   }
   const server = mkStatus('server-status')
+  // 执行引擎状态卡：与真实 index.html 的 #runner-status 对应。
+  const runner = mkStatus('runner-status')
   const capability = mkStatus('capability-status')
 
   const actions = new FakeElement('section', { className: 'card actions' })
@@ -117,11 +119,25 @@ export function createDocument() {
     buttons[cmd] = { btn, reason }
   }
 
+  // 危险操作区块（解除配对）：结构同 actions，但独立成一块以匹配真实布局。
+  const danger = new FakeElement('section', { className: 'card actions danger' })
+  for (const cmd of ['unpair_device']) {
+    const wrap = new FakeElement('div', { className: 'action' })
+    const btn = new FakeElement('button', { dataset: { cmd } })
+    const reason = new FakeElement('p', {
+      className: 'reason',
+      dataset: { reasonFor: cmd },
+    })
+    wrap.append(btn, reason)
+    danger.append(wrap)
+    buttons[cmd] = { btn, reason }
+  }
+
   const diag = new FakeElement('p', { id: 'diag', className: 'diag' })
   const foot = new FakeElement('footer', { className: 'foot' })
   foot.append(diag)
 
-  app.append(server, capability, actions, foot)
+  app.append(server, runner, capability, actions, danger, foot)
 
   const doc = {
     readyState: 'loading',

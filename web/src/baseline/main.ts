@@ -18,7 +18,8 @@
  * 仍能让用户看到标题与说明。白屏是最坏结果，任何兜底都优于白屏。
  */
 
-import { COMMANDS, NO_TAURI_REASON, call, probeMany, type CapState } from '../desktop/tauriBridge'
+import { COMMANDS, NO_TAURI_REASON, call, probe, probeMany, type CapState } from '../desktop/tauriBridge'
+import { describe, describeWithRestarts, type PhaseTone } from '../desktop/runnerPhase'
 
 /** 服务端探测超时：3s（§14.5 明确指定）。桌面壳启动即探测，不能长时间挂着转圈 */
 const HEALTH_TIMEOUT_MS = 3000
@@ -107,7 +108,13 @@ async function probeServer(): Promise<ServerState> {
 /* ============ 能力探测与按钮门禁 ============ */
 
 /** 界面上的三个按钮 → 对应壳命令（单一数据源，避免 HTML 与逻辑漂移） */
-const BUTTON_COMMANDS = [COMMANDS.checkUpdate, COMMANDS.openSettings, COMMANDS.openLogs] as const
+const BUTTON_COMMANDS = [
+  COMMANDS.checkUpdate,
+  COMMANDS.openSettings,
+  COMMANDS.openLogs,
+  // 解绑按钮也要参与能力探测：壳太旧时它必须置灰，而不是点了才报错。
+  COMMANDS.unpairDevice,
+] as const
 
 /**
  * 把能力状态落到按钮上：**可用才放开点击，不可用就置灰并写明 reason**。
@@ -183,6 +190,92 @@ function renderDiagnostics(server: ServerState, hasTauri: boolean): void {
   box.textContent = parts.join(' · ')
 }
 
+/* ============ 执行引擎状态 ============ */
+
+/** `runner_status` 的响应形状（字段名属后端契约，见 hd-host/src/commands.rs）。 */
+interface RunnerStatusBody {
+  state?: string
+  restarts?: number
+  last_heartbeat_ms?: number
+}
+
+/**
+ * 读取并渲染执行引擎状态。
+ *
+ * 失败时**不显示「未知错误」**：拿不到状态最常见的原因是壳太旧（没有
+ * `runner_status` 这个 command），此时一句「请升级客户端」比报错有用得多。
+ * 判定依据用 `probe()` 而不是猜错误文本 —— 与按钮置灰共用同一套能力清单。
+ */
+async function renderRunnerStatus(): Promise<void> {
+  const root = el<HTMLElement>('#runner-status')
+  if (!root) return
+
+  const cap = await probe(COMMANDS.runnerStatus)
+  if (!cap.ok) {
+    setStatus(root, 'warn', cap.reason, 'muted')
+    return
+  }
+
+  const raw = await call<RunnerStatusBody>(COMMANDS.runnerStatus)
+  if (raw === null) {
+    // 命令存在但调用失败：IPC 层异常，与「壳太旧」区分开。
+    setStatus(root, 'error', '读取执行引擎状态失败（详见开发者控制台）', 'error')
+    return
+  }
+
+  const d = describe(raw.state)
+  const restarts = typeof raw.restarts === 'number' ? raw.restarts : 0
+  let text = describeWithRestarts(raw.state, restarts)
+
+  // 给「需要等待」的中间态补一句安心的说明，避免用户以为要手动操作。
+  if (d.transient) {
+    text += '，正在自动恢复，请稍候'
+  }
+  // 外部实例在跑时，本窗口改配置不生效 —— 必须说破，否则用户会反复点设置。
+  if (raw.state === 'externally_running') {
+    text += '。本窗口仅做状态监护，请在那个实例中修改配置'
+  }
+
+  // `PhaseTone` 有 muted（中性态），而 `setStatus` 的 state 只接受
+  // checking/ok/warn/error —— 中性态在卡片色条上没有独立样式，
+  // 映射到 checking（同样是无色条的灰态）。
+  setStatus(root, toneToState(d.tone), text, toneToText(d.tone))
+}
+
+/** 把相位的语义色调映射到状态卡的 `data-state`（决定左侧色条）。 */
+function toneToState(tone: PhaseTone): 'ok' | 'warn' | 'error' | 'checking' {
+  switch (tone) {
+    case 'ok':
+      return 'ok'
+    case 'warn':
+      return 'warn'
+    case 'error':
+      return 'error'
+    case 'muted':
+      // 中性态没有专属色条，复用 checking 的灰态。
+      return 'checking'
+  }
+}
+
+/**
+ * 把相位的语义色调映射到**文字**色调。
+ *
+ * 文字只有三档（ok / error / muted），没有 warn —— 这是刻意的：
+ * `backoff`（重连中）、`needs_pairing`（待配对）这类"需要人看一眼但不算故障"
+ * 的状态，用灰字配黄色条的组合表达，比整行飘红更准确。红字留给真正的故障。
+ */
+function toneToText(tone: PhaseTone): 'ok' | 'error' | 'muted' {
+  switch (tone) {
+    case 'ok':
+      return 'ok'
+    case 'error':
+      return 'error'
+    case 'warn':
+    case 'muted':
+      return 'muted'
+  }
+}
+
 /* ============ 按钮行为 ============ */
 
 /**
@@ -202,6 +295,22 @@ const ACTION_FEEDBACK: Record<string, string> = {
   [COMMANDS.checkUpdate]: '已请求检查更新（若壳返回新版本会另行提示）',
   [COMMANDS.openSettings]: '已请求打开设置页',
   [COMMANDS.openLogs]: '已请求打开日志',
+  [COMMANDS.unpairDevice]: '已解除配对：设备令牌已清除，请重新输入配对码完成绑定',
+}
+
+/**
+ * 需要二次确认的命令及其确认文案。
+ *
+ * 为什么确认放在这里而不是 HTML 的 `onclick`：确认文案要与命令名**同源维护**，
+ * 分散到 HTML 里一旦命令改名就会漏掉提示（用户可能就此误删了凭据）。
+ *
+ * 解除配对是**不可逆**的（密钥链条目被删除后无法恢复），因此必须拦一道。
+ */
+const CONFIRM_PROMPTS: Record<string, string> = {
+  [COMMANDS.unpairDevice]:
+    '确定要解除配对吗？\n\n' +
+    '这会清除本机保存的设备令牌，且无法撤销。\n' +
+    '解除后需要重新获取配对码才能继续使用本设备。',
 }
 
 async function handleAction(btn: HTMLButtonElement): Promise<void> {
@@ -210,6 +319,11 @@ async function handleAction(btn: HTMLButtonElement): Promise<void> {
   // 置灰期间不应触发，但双击/键盘仍可能挤进来；再判一次最稳
   if (btn.disabled) return
 
+  // 不可逆操作先确认。用户取消时保持原状态，不写任何反馈文案
+  // （写「已取消」会让 reason 行看起来像出过错）。
+  const prompt = CONFIRM_PROMPTS[cmd]
+  if (prompt && !globalThis.confirm(prompt)) return
+
   const result = await call<unknown>(cmd)
   if (!reasonBox) return
   // 用 reason 行复用为「操作反馈」：不新增 DOM 结构，减少基线维护面
@@ -217,24 +331,48 @@ async function handleAction(btn: HTMLButtonElement): Promise<void> {
     result === null
       ? `命令 ${cmd} 未成功（详见开发者控制台），请重试或升级客户端`
       : (ACTION_FEEDBACK[cmd] ?? `命令 ${cmd} 已执行`)
+
+  // 解绑成功后刷新两张状态卡：相位已切到 needs_pairing、能力门禁也可能随之变化。
+  if (cmd === COMMANDS.unpairDevice && result !== null) {
+    await refreshStatusPanels()
+  }
 }
 
 /* ============ 启动 ============ */
 
+/**
+ * 刷新两张设备侧状态卡（执行引擎 + 能力门禁）。
+ *
+ * 抽成函数供两处复用：首次启动、以及解绑成功后（相位变了、能力可能也变了）。
+ * 不并入 `bootstrap` 是因为解绑后的刷新**不该重跑服务端探测** ——
+ * 那会白等最多 3s，而服务端连通性并没有因为解绑而改变。
+ */
+async function refreshStatusPanels(): Promise<void> {
+  // 两张卡并行：都属于本机 IPC，串行没有收益。
+  await Promise.all([renderRunnerStatus(), refreshCapability()])
+}
+
+/** 重新探测能力并刷新按钮门禁与总览文案。 */
+async function refreshCapability(): Promise<void> {
+  const states = await probeMany(BUTTON_COMMANDS)
+  applyCapability(states)
+  summarizeCapability(states)
+}
+
 export async function bootstrap(): Promise<void> {
   const hasTauri = typeof (globalThis as { __TAURI__?: unknown }).__TAURI__ === 'object'
 
-  // 两个探测并行：壳能力走 IPC（快），服务端走网络（可能 3s）。
+  // 三个探测并行：壳能力走 IPC（快），服务端走网络（可能 3s）。
   // 串行会让用户先看 3s 空白，这段等待在兜底界面上尤其刺眼。
   const serverPromise = probeServer()
-  const capPromise = probeMany(BUTTON_COMMANDS)
+  const capPromise = refreshCapability()
+  // 执行引擎状态也走 IPC，与能力探测同时发起。
+  const runnerPromise = renderRunnerStatus()
 
   bindActions()
 
   // 先把能力结果落地（通常 IPC 先回），用户最快的可点反馈来自这里
-  const states = await capPromise
-  applyCapability(states)
-  summarizeCapability(states)
+  await capPromise
 
   const server = await serverPromise
   if (server.kind === 'ok') {
@@ -254,6 +392,8 @@ export async function bootstrap(): Promise<void> {
     )
   }
 
+  // 引擎状态与诊断信息都依赖前面几步的结果，放最后收尾。
+  await runnerPromise
   renderDiagnostics(server, hasTauri)
 }
 

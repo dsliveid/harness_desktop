@@ -22,6 +22,7 @@ const here = path.dirname(fileURLToPath(import.meta.url))
  */
 const entries = [
   { src: '../src/desktop/tauriBridge.ts', out: '.build/tauriBridge.mjs' },
+  { src: '../src/desktop/runnerPhase.ts', out: '.build/runnerPhase.mjs' },
   { src: '../src/baseline/main.ts', out: '.build/baseline.mjs' },
 ]
 

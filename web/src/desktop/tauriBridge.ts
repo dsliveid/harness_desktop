@@ -40,6 +40,22 @@ export const COMMANDS = {
   openSettings: 'open_settings',
   /** 打开日志目录 / 日志面板 */
   openLogs: 'open_logs',
+  /** 设备/配对状态（`paired` / `online` / `device_id` …） */
+  deviceStatus: 'device_status',
+  /** Runner 生命周期快照（`state` / `restarts` / `last_heartbeat_ms`） */
+  runnerStatus: 'runner_status',
+  /** 启动流程走到哪一步（`state` / `detail`） */
+  bootState: 'get_boot_state',
+  /** 工作区白名单读写 */
+  getWorkspaceRoots: 'get_workspace_roots',
+  setWorkspaceRoots: 'set_workspace_roots',
+  /**
+   * 解除配对（**不可逆**）：停 Runner → 清密钥链令牌 → 切「需要配对」。
+   *
+   * 这是客户端侧唯一能让「主动解约」成立的入口。调用前 UI 必须二次确认 ——
+   * 清掉的令牌无法恢复，用户只能重新走配对码流程。
+   */
+  unpairDevice: 'unpair_device',
 } as const
 
 /** 所有已知命令名 */

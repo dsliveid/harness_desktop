@@ -25,6 +25,16 @@
         <p class="line-detail">正在探测服务端…</p>
       </section>
 
+      <!--
+        执行引擎（Runner）生命周期状态。
+        与「服务端连接」分开两张卡：服务端可达但 Runner 可能已崩/在重连，
+        两者的排障动作完全不同（前者查网络/服务端，后者查本机进程）。
+      -->
+      <section id="runner-status" class="card status" data-state="checking" aria-live="polite">
+        <strong class="line-title">执行引擎</strong>
+        <p class="line-detail">正在读取执行引擎状态…</p>
+      </section>
+
       <section id="capability-status" class="card status" data-state="checking" aria-live="polite">
         <strong class="line-title">本机能力</strong>
         <p class="line-detail">正在读取客户端能力清单…</p>
@@ -43,6 +53,19 @@
           <button type="button" data-cmd="open_logs" disabled>查看日志</button>
           <p class="reason" data-reason-for="open_logs"></p>
         </div>
+      </section>
+
+      <!--
+        解除配对是**不可逆**操作（清掉密钥链令牌，只能重走配对码流程），
+        因此单独一块、带说明与二次确认，不和日常按钮混在一起。
+      -->
+      <section class="card actions danger">
+        <strong class="line-title">设备绑定</strong>
+        <div class="action">
+          <button type="button" data-cmd="unpair_device" disabled>解除配对</button>
+          <p class="reason" data-reason-for="unpair_device"></p>
+        </div>
+        <p class="hint">解除后将清除本机保存的设备令牌，需要重新输入配对码才能继续使用。</p>
       </section>
 
       <footer class="foot">

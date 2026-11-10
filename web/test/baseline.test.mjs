@@ -172,10 +172,18 @@ test('壳缺命令：只有缺失项置灰且 reason 带命令名，其余可点
 test('壳能力齐备：全部可点且不显示任何 reason', async () => {
   const { buttons, capability } = await loadBaseline({
     fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
-    tauri: fakeTauri(['check_update', 'open_settings', 'open_logs']),
+    // 必须列出界面上的**全部** data-cmd，否则 `summarizeCapability` 会因
+    // 「有按钮不可用」而降级为 warn —— 这是真实行为，不是测试放宽。
+    tauri: fakeTauri([
+      'check_update',
+      'open_settings',
+      'open_logs',
+      'unpair_device',
+      'runner_status',
+    ]),
   })
 
-  for (const cmd of ['check_update', 'open_settings', 'open_logs']) {
+  for (const cmd of ['check_update', 'open_settings', 'open_logs', 'unpair_device']) {
     assert.equal(buttons[cmd].btn.disabled, false, `${cmd} 应可点`)
     assert.equal(buttons[cmd].reason.textContent, '')
   }
