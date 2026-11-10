@@ -605,13 +605,22 @@ impl Daemon {
 
         // stdout / stderr 分别起搬运任务写进同一个 ring，
         // 用两行前缀区分来源；两路都读到 EOF 才算子进程真的停止输出。
+        //
+        // 🔴 只有 **stdout** 那一侧带 `stats`：Runner 的心跳控制行走 stdout，
+        // 在这里被打点并拦下；stderr 是纯日志通道，绝不能做任何拦截，
+        // 否则用户排障时会莫名丢掉日志行。
         if let Some(out) = child.stdout.take() {
             let shared = self.shared_sink();
-            tokio::spawn(pump_lines(out, "[runner:out]", shared));
+            tokio::spawn(pump_lines(
+                out,
+                "[runner:out]",
+                shared,
+                Some(Arc::clone(&self.stats)),
+            ));
         }
         if let Some(err) = child.stderr.take() {
             let shared = self.shared_sink();
-            tokio::spawn(pump_lines(err, "[runner:err]", shared));
+            tokio::spawn(pump_lines(err, "[runner:err]", shared, None));
         }
 
         *self.running.lock().await = Some(RunningChild {
@@ -761,8 +770,27 @@ impl LogSink {
 /// 读取子进程输出流，逐行送到 sink。
 ///
 /// 单独抽成函数便于单测：给它一对 `BufReader` 就能验证「超长行被截断」「行数受限」。
-pub async fn pump_lines<R>(reader: R, prefix: &'static str, sink: Arc<LogSink>)
-where
+///
+/// ## `stats` 参数：心跳控制行的打点与拦截
+///
+/// Runner 在**每次心跳成功后**会往 stdout 写一行 `{"op":"heartbeat","at_ms":N}`。
+/// 本函数在写入 `sink` **之前**识别它：
+///
+/// - `stats` 为 `Some` → 说明这是 **stdout** 泵：调用
+///   [`RuntimeStats::mark_heartbeat`] 打点，然后 **`continue` 丢弃该行**。
+///   若不打点，`last_heartbeat_ms` 恒为 0，`device_status` 永远走
+///   「hb==0 → 视为在线」的乐观分支，「进程还在但连不上服务端」在 UI 上不可见；
+///   若不丢弃，心跳每 15s 往 UI 日志面板刷一行纯噪音。
+/// - `stats` 为 `None` → 说明这是 **stderr** 泵：纯日志通道，逐行照收、绝不拦截。
+///
+/// 只拦 stdout 是刻意的：用户排障时看到的日志行数与 Runner 实际打印一致，
+/// 不会因为「某行长得像 JSON」而莫名消失。
+pub async fn pump_lines<R>(
+    reader: R,
+    prefix: &'static str,
+    sink: Arc<LogSink>,
+    stats: Option<Arc<RuntimeStats>>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -770,7 +798,20 @@ where
     let mut lines = BufReader::new(reader).lines();
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => sink.push(format!("{prefix} {line}")),
+            Ok(Some(line)) => {
+                // 心跳控制行：只打点，不进日志。判定与构造共用 hd-runner 的同一份
+                // 实现，避免两端各拼一份字符串字面量后静默失配。
+                if let Some(stats) = stats.as_ref() {
+                    if hd_runner::heartbeat::is_heartbeat_control_line(&line) {
+                        stats.mark_heartbeat();
+                        // 降级为 debug 而非直接消失：排障时仍能 -v 看到「确实收到了」，
+                        // 但默认日志级别下不会污染 UI 面板。
+                        tracing::debug!(target: "hd_host::daemon", "收到 Runner 心跳控制行");
+                        continue;
+                    }
+                }
+                sink.push(format!("{prefix} {line}"))
+            }
             // EOF：子进程关闭了输出（通常意味着要退出了）。
             Ok(None) => break,
             Err(e) => {
@@ -1027,7 +1068,8 @@ mod tests {
             ring: Arc::clone(&ring),
         });
         let src: &[u8] = b"a\nb\n";
-        pump_lines(src, "[t]", sink).await;
+        // `None` == stderr 泵：纯日志通道，不解码心跳。
+        pump_lines(src, "[t]", sink, None).await;
 
         let lines = ring.lock().unwrap().snapshot();
         assert_eq!(lines, vec!["[t] a", "[t] b"]);
@@ -1044,11 +1086,118 @@ mod tests {
         for i in 0..100 {
             src.push_str(&format!("flood-{i}\n"));
         }
-        pump_lines(src.as_bytes(), "[flood]", sink).await;
+        pump_lines(src.as_bytes(), "[flood]", sink, None).await;
 
         let guard = ring.lock().unwrap();
         assert_eq!(guard.len(), 5, "刷屏时必须限长，否则宿主内存会被撑爆");
         assert_eq!(guard.dropped(), 95);
         assert!(guard.snapshot().last().unwrap().contains("flood-99"));
+    }
+
+    // ---------- 心跳控制行：打点 / 不误触发 / 不进 UI 日志 ----------
+
+    /// 单测辅助：构造一对 (ring, sink) 供断言日志快照。
+    fn sink_pair(capacity: usize) -> (Arc<Mutex<LineRing>>, Arc<LogSink>) {
+        let ring = Arc::new(Mutex::new(LineRing::new(capacity)));
+        let sink = Arc::new(LogSink {
+            ring: Arc::clone(&ring),
+        });
+        (ring, sink)
+    }
+
+    /// ① stdout 出现心跳控制行 → `last_heartbeat_ms() > 0`。
+    ///
+    /// 这是本项缺陷的**核心回归断言**：改动前该值恒为 0，
+    /// `device_status` 只能靠「进程在跑」猜在线。
+    #[tokio::test]
+    async fn pump_lines_marks_heartbeat_on_control_line() {
+        let (ring, sink) = sink_pair(LOG_RING_CAPACITY);
+        let stats = Arc::new(RuntimeStats::default());
+        assert_eq!(stats.last_heartbeat_ms(), 0, "初始必须为 0（乐观分支前提）");
+
+        let line = hd_runner::heartbeat::heartbeat_control_line(1_731_000_000_123);
+        pump_lines(
+            format!("{line}\n").as_bytes(),
+            "[runner:out]",
+            sink,
+            Some(Arc::clone(&stats)),
+        )
+        .await;
+
+        assert!(
+            stats.last_heartbeat_ms() > 0,
+            "收到心跳控制行后必须打点，否则乐观分支永远关不掉"
+        );
+        // ③ 同一条断言：心跳行**不能**出现在 UI 日志快照里（防每 15s 刷噪音）。
+        let logs = ring.lock().unwrap().snapshot();
+        assert!(logs.is_empty(), "心跳控制行不得进入 UI 日志：{logs:?}");
+    }
+
+    /// ② 非 heartbeat 的普通行（auth / cmd / eof，以及名字相近的诱饵）不误触发心跳，
+    /// 且必须**照常进入日志**（不能被吞）。
+    #[tokio::test]
+    async fn pump_lines_ignores_non_heartbeat_lines() {
+        let (ring, sink) = sink_pair(LOG_RING_CAPACITY);
+        let stats = Arc::new(RuntimeStats::default());
+
+        // 逐类覆盖真实会出现 / 容易误判的行。均**不含**合法心跳。
+        let src = concat!(
+            r#"{"op":"auth","token":"hgd_x","ws_url":"wss://h/ws"}"#,
+            "\n",
+            r#"{"op":"shutdown"}"#,
+            "\n",
+            r#"{"op":"reload_policy","roots":[]}"#,
+            "\n",
+            "认证完成\n",
+            // 名字相近的诱饵：必须严格匹配 op 值，不能靠 contains("heartbeat")
+            r#"{"op":"heartbeat_typo"}"#,
+            "\n",
+            r#"{"op":"HEARTBEAT"}"#,
+            "\n",
+            "heartbeat ok\n",
+        );
+        pump_lines(
+            src.as_bytes(),
+            "[runner:out]",
+            sink,
+            Some(Arc::clone(&stats)),
+        )
+        .await;
+
+        assert_eq!(
+            stats.last_heartbeat_ms(),
+            0,
+            "普通行与诱饵行都不得触发心跳打点"
+        );
+
+        let logs = ring.lock().unwrap().snapshot();
+        assert_eq!(
+            logs.len(),
+            7,
+            "非心跳行必须原样进日志（不能被拦截逻辑吞掉）：{logs:?}"
+        );
+        assert!(logs[0].contains("\"op\":\"auth\""));
+        assert!(logs[6].contains("heartbeat ok"));
+    }
+
+    /// ③ stderr 泵（`stats == None`）绝不能拦截心跳形状的行：
+    /// 用户排障时看到的行数必须与 Runner 实际打印一致。
+    #[tokio::test]
+    async fn stderr_pump_never_filters_heartbeat_shaped_lines() {
+        let (ring, sink) = sink_pair(LOG_RING_CAPACITY);
+        let line = hd_runner::heartbeat::heartbeat_control_line(1);
+
+        pump_lines(
+            format!("{line}\n").as_bytes(),
+            "[runner:err]",
+            sink,
+            // 明确模拟 stderr：不传 stats。
+            None,
+        )
+        .await;
+
+        let logs = ring.lock().unwrap().snapshot();
+        assert_eq!(logs.len(), 1, "stderr 不得过滤任何行：{logs:?}");
+        assert!(logs[0].contains("heartbeat"));
     }
 }

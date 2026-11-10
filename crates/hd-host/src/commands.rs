@@ -73,6 +73,28 @@ pub struct RunnerStatusResponse {
     pub restarts: u32,
 }
 
+/// `set_workspace_roots` 的响应 —— **三态契约**：成功 / 已保存但未下发 / 真失败。
+///
+/// ## 为什么不是 `Result<Vec<String>, _>`
+///
+/// 「配置已保存、但没能同步给执行引擎」是一件**既非成功也非失败**的事：配置确实
+/// 落库了，用户重试或重启客户端即可收敛。若继续用 `Err(CommandError::PushFailed)`
+/// 穿过 IPC，Tauri 会把 promise reject，前端 `tauriBridge.call()` 按铁律把它归一成
+/// `null`，于是界面只能说「命令未成功」—— 与「配置其实已保存」的事实**直接矛盾**，
+/// 用户会以为白改了一遍。
+///
+/// 因此把它做成**成功结果里的降级标记**：`Ok` + `pushed == false` + `warning` 人话。
+/// 前端据此用 warn 色（而非红字）表达，红字只留给真故障。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRootsResult {
+    /// 归一后的工作区根（前端据此刷新面包屑，避免显示与 `fs.list` 不一致的原始路径）。
+    pub roots: Vec<String>,
+    /// 是否已成功下发给执行引擎（Runner）。
+    pub pushed: bool,
+    /// `pushed == false` 时给人看的说明；`pushed == true` 时恒为 `None`。
+    pub warning: Option<String>,
+}
+
 /// `start_pairing` 的响应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartPairingResponse {
@@ -446,13 +468,20 @@ pub fn set_workspace_roots(
 /// 界面上看是「没改」，实际权限已扩大，属于最容易漏审的状态不一致。
 ///
 /// 下发失败时不回滚宿主状态：路由器的 `Arc<Policy>` 是快照语义，回滚需要重建 Router，
-/// 而 Runner 侧可能已部分生效。这里选择**把失败如实报给调用方**（fail-loud），
-/// 让前端能提示「配置已保存但未能同步到执行引擎，请重试或重启客户端」。
+/// 而 Runner 侧可能已部分生效。这里选择**如实告知调用方发生了什么**，但要注意
+/// **用什么形式告知**：配置已落库这一事实不会因为下发失败而改变，所以「已保存但未
+/// 下发」不是 `Err`，而是 `Ok` 里的 `pushed = false` + `warning`（见
+/// [`WorkspaceRootsResult`] 的文档）。前端据此用 warn 色提示「请重试或重启客户端」，
+/// 而不是把它当故障报「命令未成功」。
+///
+/// 只有**校验类错误**（`EmptyRoots` / `NotADirectory` / `Unresolvable`）才是真失败，
+/// 它们仍然冒泡成 `Err` —— 那时配置根本没保存，用户必须改输入。
 pub async fn set_workspace_roots_and_push(
     state: &HostState,
     roots: Vec<String>,
-) -> Result<Vec<String>, CommandError> {
+) -> Result<WorkspaceRootsResult, CommandError> {
     // ① 校验 + 归一 + 写入宿主状态（复用同步版，避免两套校验逻辑漂移）。
+    //    这一行之后，「配置已保存」既成事实；因此后续任何失败都不能报成「没保存」。
     let normalized = set_workspace_roots(state, roots)?;
 
     // ② 取刚写入的那份 Policy 快照下发给 Runner。
@@ -460,15 +489,56 @@ pub async fn set_workspace_roots_and_push(
     //    是同一个归一结果（重新构造可能在极端并发下算出不同值）。
     let policy = state.policy();
 
-    // ③ Runner 没在跑时不算错误：白名单会随下次 spawn 的 initial_roots + 随后的
-    //    reload_policy 生效。此时 `send_line` 会返回「Runner 未运行」，属预期分支。
-    match state.daemon().reload_policy(&policy).await {
-        Ok(()) => Ok(normalized),
-        Err(e) if is_runner_not_running(&e) => {
+    // ③ 三种结果收敛成三态（判定逻辑抽成纯函数，便于穷举单测，见
+    //    `classify_push_outcome`）：
+    //    - Ok            → 真下发成功（pushed = true，无 warning）
+    //    - Runner 未运行 → 预期分支（白名单随下次 spawn 生效），仍算「未下发」但要解释清楚
+    //    - 其它写失败    → 真下发失败（管道坏/写超时），同样归入「未下发」并给出原因
+    let pushed = state.daemon().reload_policy(&policy).await;
+    Ok(classify_push_outcome(normalized, &pushed))
+}
+
+/// 把「下发结果」翻译成 [`WorkspaceRootsResult`] —— 三态判定的**唯一事实源**。
+///
+/// 抽成纯函数而不是写在 async 函数里的 `match`：真实下发要么成功、要么只能靠真子进程
+/// 制造失败（`send_line` 在无 Runner 时永远回 `WriteAuth`），那样「真下发失败」这一
+/// 分支就永远测不到。抽出判定后，三个分支都能用构造出来的 `DaemonError` 穷举覆盖。
+///
+/// `pushed` 形参即取名字段：三态中「已保存但未下发」的两个子原因（Runner 未运行 /
+/// 写管道失败）对用户是同一件事——**配置保住了，等下次同步**，因此都映射为
+/// `pushed = false` + `warning`，而不是 `Err`（用 `Err` 会被前端归一成 null，语义丢失）。
+fn classify_push_outcome(
+    normalized: Vec<String>,
+    pushed: &Result<(), crate::daemon::DaemonError>,
+) -> WorkspaceRootsResult {
+    match pushed {
+        Ok(()) => WorkspaceRootsResult {
+            roots: normalized,
+            pushed: true,
+            warning: None,
+        },
+        Err(e) if is_runner_not_running(e) => {
             tracing::debug!("Runner 未运行，工作区白名单将在下次启动时下发");
-            Ok(normalized)
+            WorkspaceRootsResult {
+                roots: normalized,
+                pushed: false,
+                // 预期分支也要说清楚「配置没丢」，否则用户会反复重试。
+                warning: Some(
+                    "执行引擎当前未运行，配置已保存，将在下次启动执行引擎时自动生效".to_string(),
+                ),
+            }
         }
-        Err(e) => Err(CommandError::PushFailed(e.to_string())),
+        Err(e) => {
+            // 🔴 `PushFailed` 变体保留：这里仍构造它用于日志与溯源（daemon 层错误的唯一
+            //    结构化出口），但**不**作为 IPC 错误出口 —— 它只是 warning 文案的来源。
+            let err = CommandError::PushFailed(e.to_string());
+            tracing::warn!("工作区白名单已保存但下发失败：{err}");
+            WorkspaceRootsResult {
+                roots: normalized,
+                pushed: false,
+                warning: Some(format!("{err}。请重试或重启客户端")),
+            }
+        }
     }
 }
 
@@ -852,11 +922,12 @@ mod tests {
 
     // ===== P3：工作区白名单必须真正下发到 Runner =====
 
-    /// 关闭「Runner 未运行」这一合法分支后，下发失败必须冒泡为 `PushFailed`。
+    /// 「Runner 未运行」必须落在三态里的**中间态**（pushed=false + warning），
+    /// 而不是 `Err`；若实现退回成只写 HostState，这里会拿到 pushed=true，测试失败。
     ///
-    /// 这条测试的价值在于钉住**下发动作真的发生了**：若有人把
-    /// `set_workspace_roots_and_push` 退回成只写 HostState 的实现，
-    /// 这里会拿到 `Ok` 而不是 `PushFailed`，测试立刻失败。
+    /// 为什么那条 `Err` 不能再被期望：`Err` 穿过 IPC 会被 Tauri 转成 promise reject，
+    /// 前端 `tauriBridge.call()` 按铁律归一成 `null` → 界面只能说「命令未成功」，
+    /// 与「配置其实已保存」直接矛盾。这条用例钉住的就是这个契约。
     #[tokio::test]
     async fn push_path_actually_attempts_to_reach_runner() {
         let st = state();
@@ -864,9 +935,17 @@ mod tests {
         let got = set_workspace_roots_and_push(&st, vec![dir.path().display().to_string()])
             .await
             .expect("Runner 未运行时下发应被视为合法分支（配置仍生效于下次启动）");
-        assert_eq!(got.len(), 1, "归一结果应被返回");
+        assert_eq!(got.roots.len(), 1, "归一结果应被返回");
+        assert!(
+            !got.pushed,
+            "本次 daemon 无子进程，不可能真的下发成功 → pushed 必须为 false"
+        );
+        assert!(
+            got.warning.as_deref().is_some_and(|w| !w.trim().is_empty()),
+            "未下发必须带人话 warning，否则前端只能显示「已执行」而误导用户"
+        );
         // 宿主侧状态已更新（先落状态、再下发的顺序保证）
-        assert_eq!(get_workspace_roots(&st), got);
+        assert_eq!(get_workspace_roots(&st), got.roots);
 
         // 证明「确实调过 daemon」而不是只写内存：
         // daemon 当前没有子进程，`send_line` 必然返回 `WriteAuth`；
@@ -907,6 +986,8 @@ mod tests {
     }
 
     /// 空列表必须在**校验阶段**就被拒绝，不应走到下发（避免把空白名单推给 Runner）。
+    ///
+    /// 校验类错误才是**真失败**：配置根本没保存，必须冒泡成 `Err`，不能混进三态中间档。
     #[tokio::test]
     async fn push_path_rejects_empty_before_any_push() {
         let st = state();
@@ -918,6 +999,127 @@ mod tests {
             get_workspace_roots(&st).is_empty(),
             "校验失败不应改动宿主状态"
         );
+    }
+
+    /// 校验类错误（不是目录）同样必须保持 `Err`：这条钉住「三态化没有把真错误也吞掉」。
+    #[tokio::test]
+    async fn push_path_keeps_validation_errors_as_err() {
+        let st = state();
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a.txt");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        let err = set_workspace_roots_and_push(&st, vec![not_a_dir.display().to_string()])
+            .await
+            .expect_err("非目录必须报错，不能被降级成「已保存但未下发」");
+        assert!(
+            matches!(err, CommandError::NotADirectory(_)),
+            "实际 {err:?}"
+        );
+        assert!(
+            get_workspace_roots(&st).is_empty(),
+            "校验失败不该留下半套配置"
+        );
+    }
+
+    // ===== P3 三态：pushed 判定的穷举覆盖 =====
+
+    /// 三态判定（`classify_push_outcome`）的穷举单测。
+    ///
+    /// 为什么必须穷举而不是只测端到端：端到端只能制造出「Runner 未运行」这一种失败
+    /// （`send_line` 在无子进程时永远回 `WriteAuth`），「真下发失败（管道坏）」这条
+    /// 分支在单测环境里造不出来。判定的三个分支必须逐个钉死，否则「已保存但未下发」
+    /// 很容易被后续改动悄悄退回 `Err`，前端又变回「命令未成功」。
+    #[test]
+    fn classify_push_outcome_covers_all_three_states() {
+        use crate::daemon::DaemonError;
+
+        let roots = vec!["C:\\ws".to_string()];
+
+        // ① 真下发成功 → Ok(pushed=true, warning=None)
+        let ok = classify_push_outcome(roots.clone(), &Ok(()));
+        assert!(ok.pushed, "下发成功必须 pushed=true");
+        assert!(
+            ok.warning.is_none(),
+            "成功时不得带 warning，否则前端会白白显示黄字"
+        );
+        assert_eq!(ok.roots, roots, "归一结果必须原样带回给前端刷面包屑");
+
+        // ② Runner 未运行 → 预期分支，仍是 pushed=false + 人话 warning
+        let not_running = classify_push_outcome(
+            roots.clone(),
+            &Err(DaemonError::WriteAuth("Runner 未运行".to_string())),
+        );
+        assert!(
+            !not_running.pushed,
+            "Runner 未运行等于没下发成功，pushed 必须为 false"
+        );
+        let w = not_running.warning.as_deref().unwrap_or_default();
+        assert!(!w.is_empty(), "未下发必须给 warning");
+        assert!(
+            w.contains("配置已保存") || w.contains("已保存"),
+            "warning 必须说清「配置没丢」，实际：{w}"
+        );
+
+        // ③ 真下发失败 → 同样 pushed=false，但 warning 要带出原因与恢复动作。
+        //    ⚠️ 这里用非 `WriteAuth` 变体：`is_runner_not_running` 按变体判定，所有
+        //    `WriteAuth` 都算「Runner 未运行」这一预期分支（见其文档），因此「真失败」
+        //    只能用其它 daemon 错误模拟（写管道异常/拉起异常在本层同属 daemon 错误）。
+        let broken = classify_push_outcome(
+            roots.clone(),
+            &Err(DaemonError::Spawn("写入管道 BrokenPipe".to_string())),
+        );
+        assert!(!broken.pushed, "写失败同样属于未下发");
+        let w = broken.warning.as_deref().unwrap_or_default();
+        assert!(
+            w.contains("BrokenPipe"),
+            "真失败必须把底层原因带给用户，实际：{w}"
+        );
+        assert!(
+            w.contains("重试") || w.contains("重启"),
+            "真失败要给出恢复动作，实际：{w}"
+        );
+        assert!(
+            w.contains("已保存"),
+            "这句话的语义是「配置保住了」，不能说成「没保存」，实际：{w}"
+        );
+
+        // 三个分支的 roots 都不该空（否则前端面包屑会被清空）
+        for (name, r) in [
+            ("ok", &ok),
+            ("not_running", &not_running),
+            ("broken", &broken),
+        ] {
+            assert_eq!(r.roots, roots, "{name} 分支丢了归一结果");
+        }
+    }
+
+    /// `WorkspaceRootsResult` 的序列化形态必须是 `{ roots, pushed, warning }` ——
+    /// 前端 `tauriBridge` 的 ReturnType 就按这个形状取值，字段名改动等于破约。
+    #[test]
+    fn workspace_roots_result_serializes_with_expected_keys() {
+        let ok = WorkspaceRootsResult {
+            roots: vec!["C:\\ws".to_string()],
+            pushed: true,
+            warning: None,
+        };
+        let v = serde_json::to_value(&ok).expect("必须可序列化");
+        assert_eq!(v["roots"][0], "C:\\ws");
+        assert_eq!(v["pushed"], true);
+        assert!(
+            v["warning"].is_null(),
+            "None 必须序列化为 null 而不是被省略"
+        );
+
+        let degraded = WorkspaceRootsResult {
+            roots: vec![],
+            pushed: false,
+            warning: Some("已保存但未下发".to_string()),
+        };
+        let v = serde_json::to_value(&degraded).expect("必须可序列化");
+        assert_eq!(v["pushed"], false);
+        assert_eq!(v["warning"], "已保存但未下发");
+        assert!(v["roots"].is_array());
     }
 
     // ===== P6：解约闭环 =====

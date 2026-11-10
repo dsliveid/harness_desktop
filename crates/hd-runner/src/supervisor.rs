@@ -557,6 +557,43 @@ fn silence_error(hb: HeartbeatPolicy) -> TransportError {
     }
 }
 
+/// 向 stdout 输出一行心跳控制行（`{"op":"heartbeat","at_ms":N}`）。
+///
+/// ## 走 stdout 而非 tracing 的理由
+///
+/// `tracing` 在本 crate 被显式配到 **stderr**（见 `cli.rs` 的
+/// `with_writer(std::io::stderr)`），而 stderr 的每一行宿主都会原样收进
+/// UI 日志面板。心跳每 15s 一次，若走日志就会变成永不停歇的噪音。
+///
+/// stdout 此前在本 crate **完全空置**，正好拿来当结构化控制通道：
+/// 宿主侧 `pump_lines` 在写进 `LogSink` 之前用
+/// [`crate::heartbeat::is_heartbeat_control_line`] 拦下它，
+/// 于是「打点」与「不污染日志」两个目标同时成立。
+///
+/// ## 为什么写失败只记 debug 不返回错误
+///
+/// stdout 写不进去（宿主已关闭读端/管道破裂）本身不是「链路坏了」的证据，
+/// 真正的链路健康由 ping/pong 判定。因此这里绝不让写失败打断心跳循环 ——
+/// 否则管道问题会伪装成网络故障，把重连决策带偏。
+fn emit_heartbeat_control() {
+    use std::io::Write as _;
+
+    let line = crate::heartbeat::heartbeat_control_line(crate::heartbeat::now_ms());
+    let mut out = std::io::stdout();
+    match out
+        .write_all(line.as_bytes())
+        .and_then(|_| out.write_all(b"\n"))
+    {
+        Ok(()) => {
+            // 立刻 flush：stdout 被当作管道时默认全缓冲，不 flush 会把控制行
+            // 憋在缓冲区里，宿主迟迟收不到 → 心跳看起来是「旧」的。
+            let _ = out.flush();
+            debug!("心跳控制行已上报到 stdout");
+        }
+        Err(e) => debug!(error = %e, "心跳控制行写入 stdout 失败（不视为链路故障）"),
+    }
+}
+
 /// 一条连接的生命周期内循环：按服务端下发节奏发心跳，并盯住对端帧/静默。
 ///
 /// 返回即代表「这条连接死了」，返回值同时是重连决策的错误来源。
@@ -625,6 +662,10 @@ async fn session_loop<L: LiveLink>(
                     next_ping = Instant::now() + hb.interval;
                     // pong 已回，等价于收到帧
                     last_rx = Instant::now();
+                    // 🔴 心跳**成功**之后才上报：这是「链路此刻真的通」的唯一直接证据。
+                    // 发送失败会走下面的 `Err` 分支直接结束本连接，因此这里不需要
+                    // 再判一次成败 —— 能走到这行就说明 ping/pong 往返已完成。
+                    emit_heartbeat_control();
                 }
                 Err(e) => return e,
             }

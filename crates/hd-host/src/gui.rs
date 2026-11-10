@@ -24,6 +24,7 @@ use crate::commands::{
     set_workspace_roots_and_push as core_set_workspace_roots_and_push,
     start_pairing as core_start_pairing, unpair_device as core_unpair_device, DeviceStatusResponse,
     HostState, ListCommandsResponse, RunnerStatusResponse, StartPairingResponse,
+    WorkspaceRootsResult,
 };
 
 /// 便于前端统一处理错误：Tauri 的 `Result<_, E>` 要求 `E: Serialize`，
@@ -91,11 +92,18 @@ pub async fn unpair_device(state: State<'_, HostState>) -> Result<(), String> {
 ///
 /// 必须走 `_and_push` 版本：宿主记了白名单而 Runner 不知道，是改造前最隐蔽的
 /// 安全口径错位（详见 `commands::set_workspace_roots_and_push` 的文档）。
+///
+/// ## 返回 `WorkspaceRootsResult` 而不是 `Vec<String>`
+///
+/// 「已保存但未下发」是**成功结果里的降级标记**，不是错误：它必须以 `Ok` 穿过 IPC，
+/// 前端才能拿到 `{ roots, pushed, warning }` 并选用 warn 色（`tauriBridge.call()`
+/// 会把任何 reject 归一成 null，用 `Err` 送这句话等于让前端只会说「命令未成功」）。
+/// 只有校验类真失败（`EmptyRoots` / `NotADirectory` / `Unresolvable`）才走 `Err`。
 #[tauri::command]
 pub async fn set_workspace_roots(
     state: State<'_, HostState>,
     roots: Vec<String>,
-) -> Result<Vec<String>, String> {
+) -> Result<WorkspaceRootsResult, String> {
     core_set_workspace_roots_and_push(&state, roots)
         .await
         .map_err(err_str)

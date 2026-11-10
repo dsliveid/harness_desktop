@@ -38,7 +38,8 @@ pub use bootstrap::{default_ws_url, needs_pairing, Bootstrap, BootstrapError, Bo
 pub use commands::{
     device_status, get_workspace_roots, list_commands, runner_status, set_workspace_roots,
     start_pairing, CommandError, DeviceStatusResponse, HostState, ListCommandsResponse,
-    RunnerStatusResponse, StartPairingResponse, FORBIDDEN_COMMANDS, SUPPORTED_COMMANDS,
+    RunnerStatusResponse, StartPairingResponse, WorkspaceRootsResult, FORBIDDEN_COMMANDS,
+    SUPPORTED_COMMANDS,
 };
 pub use daemon::{
     build_auth_line, build_reload_policy_line, exe_suffix, locate_runner, Daemon, DaemonError,
