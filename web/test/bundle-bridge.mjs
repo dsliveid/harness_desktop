@@ -23,6 +23,8 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const entries = [
   { src: '../src/desktop/tauriBridge.ts', out: '.build/tauriBridge.mjs' },
   { src: '../src/desktop/runnerPhase.ts', out: '.build/runnerPhase.mjs' },
+  // 操作反馈三态判定（ok / warn / error）：纯逻辑，直接 import 做穷举单测
+  { src: '../src/desktop/actionFeedback.ts', out: '.build/actionFeedback.mjs' },
   { src: '../src/baseline/main.ts', out: '.build/baseline.mjs' },
 ]
 
@@ -41,4 +43,6 @@ for (const { src, out } of entries) {
   })
 }
 
-console.log('[test] 已打包 test/.build/tauriBridge.mjs 与 test/.build/baseline.mjs')
+console.log(
+  '[test] 已打包 test/.build/{tauriBridge,runnerPhase,actionFeedback,baseline}.mjs',
+)

@@ -1,4 +1,6 @@
 # 基线 UI 的产物与中间物不入库
 node_modules/
 dist-baseline/
+# 开发态 dev server 的产物目录（与 dist-baseline 刻意分离，见 dev-server.mjs 文件头）
+.dev-out/
 test/.build/

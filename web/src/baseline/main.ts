@@ -18,7 +18,15 @@
  * 仍能让用户看到标题与说明。白屏是最坏结果，任何兜底都优于白屏。
  */
 
-import { COMMANDS, NO_TAURI_REASON, call, probe, probeMany, type CapState } from '../desktop/tauriBridge'
+import {
+  COMMANDS,
+  NO_TAURI_REASON,
+  call,
+  probe,
+  probeMany,
+  type CapState,
+} from '../desktop/tauriBridge'
+import { describeActionResult, toneToReasonClass } from '../desktop/actionFeedback'
 import { describe, describeWithRestarts, type PhaseTone } from '../desktop/runnerPhase'
 
 /** 服务端探测超时：3s（§14.5 明确指定）。桌面壳启动即探测，不能长时间挂着转圈 */
@@ -132,15 +140,23 @@ function applyCapability(states: Map<string, CapState>): void {
     if (state && state.ok) {
       btn.disabled = false
       btn.removeAttribute('title')
-      if (reasonBox) reasonBox.textContent = ''
+      if (reasonBox) {
+        reasonBox.textContent = ''
+        // 重置色调类：否则上一次操作留下的 is-ok/is-warn/is-error 会残留到下一次反馈上
+        reasonBox.className = 'reason'
+      }
       return
     }
 
     // 兜底：未探测到该命令也按不可用处理（fail-closed，与 hd-core Guarded 同一取向）
+    // 置灰原因是「需要看一眼的降级」而非故障：沿用 reason 行默认的 warn 色。
     const reason = state ? state.reason : '能力未探测，暂不可用'
     btn.disabled = true
     btn.setAttribute('title', reason)
-    if (reasonBox) reasonBox.textContent = reason
+    if (reasonBox) {
+      reasonBox.textContent = reason
+      reasonBox.className = 'reason'
+    }
   })
 }
 
@@ -296,6 +312,26 @@ const ACTION_FEEDBACK: Record<string, string> = {
   [COMMANDS.openSettings]: '已请求打开设置页',
   [COMMANDS.openLogs]: '已请求打开日志',
   [COMMANDS.unpairDevice]: '已解除配对：设备令牌已清除，请重新输入配对码完成绑定',
+  // 工作区设置是**三态**命令（见 handleWorkspaceRootsResult），这里的文案只覆盖
+  // 「已保存并同步」那一档；另两档由判据分支给出，故不放进这张表。
+  [COMMANDS.setWorkspaceRoots]: '已保存并同步到执行引擎',
+}
+
+/**
+ * 把一次操作的结果渲染到 reason 行，色调由 `describeActionResult` 判定。
+ *
+ * 🔴 为什么必须三态：后端 `set_workspace_roots` 的「已保存但未同步给执行引擎」
+ * 是 `Ok(pushed=false, warning=...)`，不是 `Err`。若把它和 `null` 混为一谈，
+ * 用户会看到「命令未成功」，而事实是配置**已经保存**了 —— 直接矛盾。
+ * 所以 `pushed=false` 必须用 warn 色 + 后端下发的人话，而不是红字。
+ *
+ * 判定逻辑本身在 `desktop/actionFeedback.ts`（纯函数，可穷举单测）；
+ * 这里只负责把结果写进 DOM，不做任何判断。
+ */
+function applyActionResult(cmd: string, raw: unknown, reasonBox: HTMLElement): void {
+  const feedback = describeActionResult(cmd, raw, ACTION_FEEDBACK[cmd] ?? `命令 ${cmd} 已执行`)
+  reasonBox.textContent = feedback.text
+  reasonBox.className = toneToReasonClass(feedback.tone)
 }
 
 /**
@@ -326,11 +362,9 @@ async function handleAction(btn: HTMLButtonElement): Promise<void> {
 
   const result = await call<unknown>(cmd)
   if (!reasonBox) return
-  // 用 reason 行复用为「操作反馈」：不新增 DOM 结构，减少基线维护面
-  reasonBox.textContent =
-    result === null
-      ? `命令 ${cmd} 未成功（详见开发者控制台），请重试或升级客户端`
-      : (ACTION_FEEDBACK[cmd] ?? `命令 ${cmd} 已执行`)
+  // 用 reason 行复用为「操作反馈」：不新增 DOM 结构，减少基线维护面。
+  // 三档判定集中在 applyActionResult（ok / warn / error），红字只留给真故障。
+  applyActionResult(cmd, result, reasonBox)
 
   // 解绑成功后刷新两张状态卡：相位已切到 needs_pairing、能力门禁也可能随之变化。
   if (cmd === COMMANDS.unpairDevice && result !== null) {

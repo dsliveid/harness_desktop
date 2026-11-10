@@ -5,6 +5,7 @@
   "type": "module",
   "description": "harness_desktop 内置最小基线 UI（纯 TS + 原生 DOM，零运行时依赖）",
   "scripts": {
+    "dev": "node dev-server.mjs",
     "typecheck": "tsc --noEmit",
     "build": "node build-baseline.mjs",
     "test": "node test/bundle-bridge.mjs && node --test test/tauriBridge.test.mjs test/runnerPhase.test.mjs test/baseline.test.mjs"

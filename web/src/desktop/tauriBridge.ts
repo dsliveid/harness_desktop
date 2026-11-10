@@ -188,6 +188,64 @@ export async function probeMany(cmds: readonly string[]): Promise<Map<string, Ca
   return new Map(pairs)
 }
 
+/* ============ 具体命令的返回体契约 ============ */
+
+/**
+ * `set_workspace_roots` 的响应 —— 后端 `WorkspaceRootsResult`（见 hd-host/src/commands.rs）。
+ *
+ * ## 为什么是「两个布尔 + 一句人话」而不是 `string[]`
+ *
+ * 「配置已保存、但没能同步给执行引擎」既不是成功也不是失败：配置确实落库了。
+ * 后端把它做成 `Ok` 里的 `pushed=false` + `warning`，正是为了让这里能**区分三态**：
+ *
+ * | 情况                    | `call()` 得到      | UI 该用的色调 |
+ * | ----------------------- | ------------------ | ------------- |
+ * | 未在壳内 / 校验类真失败 | `null`             | error（红）   |
+ * | 已保存但未下发          | `{pushed: false}`  | warn（黄）    |
+ * | 已保存并同步            | `{pushed: true}`   | ok（绿）      |
+ *
+ * 若后端仍用 `Err` 送这条信息，Tauri 会让 promise reject → `call()` 归一成 `null`
+ * → 界面只能说「命令未成功」，与「配置其实已保存」直接矛盾。
+ */
+export interface WorkspaceRootsResult {
+  /** 归一后的工作区根（前端据此刷新面包屑，别用自己那份原始输入） */
+  roots: string[]
+  /** 是否已成功下发给执行引擎 */
+  pushed: boolean
+  /** `pushed === false` 时给人看的说明；成功时为 `null` */
+  warning: string | null
+}
+
+/**
+ * 宽松解析 `WorkspaceRootsResult`（壳侧版本不一致时可能缺字段/形状不同）。
+ *
+ * 返回 `null` 表示「这不是工作区结果」—— 调用方据此回落到普通命令的成功文案，
+ * 而不是把一个畸形对象当成功展示。刻意不抛：与 `call()` 的「永不 throw」同取向。
+ */
+export function normalizeWorkspaceRootsResult(raw: unknown): WorkspaceRootsResult | null {
+  if (!raw || typeof raw !== 'object') return null
+  const rec = raw as Record<string, unknown>
+  // `pushed` 是这个契约的判别字段：没有它就不是工作区结果
+  if (typeof rec['pushed'] !== 'boolean') return null
+  const roots = Array.isArray(rec['roots'])
+    ? rec['roots'].filter((r): r is string => typeof r === 'string')
+    : []
+  const warning = typeof rec['warning'] === 'string' ? rec['warning'] : null
+  return { roots, pushed: rec['pushed'], warning }
+}
+
+/**
+ * 设置工作区白名单并下发（**唯一入口**，禁止业务代码裸调 invoke）。
+ *
+ * 返回 `null` 有两种可能（都是「本次没成功」）：无壳/壳太旧、或后端校验类真失败
+ * （空列表、路径不是目录、无法归一）。后端「已保存但未下发」不会走到这里，
+ * 它是 `pushed=false` 的**成功**返回，由 UI 用 warn 色表达。
+ */
+export async function setWorkspaceRoots(roots: string[]): Promise<WorkspaceRootsResult | null> {
+  const raw = await call<unknown>(COMMANDS.setWorkspaceRoots, { roots })
+  return normalizeWorkspaceRootsResult(raw)
+}
+
 /**
  * 执行本机命令 —— **基线/远程 UI 的唯一调用入口**。
  *

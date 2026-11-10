@@ -61,6 +61,114 @@ function fakeTauri(supported) {
 
 const detail = (section) => section.querySelector('.line-detail')
 
+/* ============ 项4：操作反馈三态（ok / warn / error） ============ */
+
+/**
+ * 三态判定的单测直接打 `desktop/actionFeedback.ts`（纯函数），不驱动 DOM。
+ *
+ * 为什么不做成「点按钮看文案」：三态里最关键的中间档（已保存但未下发）需要壳返回
+ * `{ roots, pushed:false, warning }`，用 DOM 桩模拟也可以，但判定逻辑本身与 DOM 无关；
+ * 单独测纯函数能让三条分支一一对应、失败时报错直指分支名。
+ */
+const ACTION_FEEDBACK_MOD = pathToFileURL(path.join(here, '.build/actionFeedback.mjs')).href
+
+test('三态①：下发成功 → 文案「已保存并同步」，色调 ok（不是 warn/error）', async () => {
+  const { describeActionResult, toneToReasonClass } = await import(ACTION_FEEDBACK_MOD)
+
+  const fb = describeActionResult(
+    'set_workspace_roots',
+    { roots: ['C:\\ws'], pushed: true, warning: null },
+    '已保存并同步到执行引擎',
+  )
+  assert.equal(fb.tone, 'ok')
+  assert.match(fb.text, /已保存并同步/)
+  assert.equal(toneToReasonClass(fb.tone), 'reason is-ok')
+})
+
+test('三态②：已保存但未下发 → warn 色 + 直接用后端 warning（绝不飘红）', async () => {
+  const { describeActionResult, toneToReasonClass } = await import(ACTION_FEEDBACK_MOD)
+
+  const warning = '工作区配置已保存，但未能同步到执行引擎：Runner 未运行。请重试或重启客户端'
+  const fb = describeActionResult(
+    'set_workspace_roots',
+    { roots: ['C:\\ws'], pushed: false, warning },
+    '已保存并同步到执行引擎',
+  )
+  // 🔴 核心断言：这一档**不是** error。红字只留给真故障。
+  assert.equal(fb.tone, 'warn', '「已保存但未下发」不是故障，必须是 warn 而非 error')
+  assert.equal(toneToReasonClass(fb.tone), 'reason is-warn')
+  // 文案必须原样采用后端下发的 warning（后端才知道具体原因）
+  assert.equal(fb.text, warning)
+  // 且不能说成「未成功」——那是改造前的错误措辞
+  assert.doesNotMatch(fb.text, /未成功/)
+  assert.match(fb.text, /已保存/)
+})
+
+test('三态②兜底：pushed=false 但后端没给 warning → 用内置兜底文案且仍为 warn', async () => {
+  const { describeActionResult, DEGRADED_PUSH_FALLBACK } = await import(ACTION_FEEDBACK_MOD)
+
+  for (const warning of [null, '', '   ']) {
+    const fb = describeActionResult(
+      'set_workspace_roots',
+      { roots: [], pushed: false, warning },
+      '已保存并同步到执行引擎',
+    )
+    assert.equal(fb.tone, 'warn')
+    assert.equal(fb.text, DEGRADED_PUSH_FALLBACK)
+    // 兜底文案也必须说清「已保存」（否则与事实矛盾）
+    assert.match(fb.text, /已保存/)
+    assert.match(fb.text, /重试|重启/)
+  }
+})
+
+test('三态③：null（真失败/无壳）→ error 色，沿用「未成功」文案', async () => {
+  const { describeActionResult, toneToReasonClass } = await import(ACTION_FEEDBACK_MOD)
+
+  const fb = describeActionResult('open_logs', null, '已请求打开日志')
+  assert.equal(fb.tone, 'error')
+  assert.equal(toneToReasonClass(fb.tone), 'reason is-error')
+  assert.match(fb.text, /未成功/)
+  assert.match(fb.text, /open_logs/)
+})
+
+test('非工作区结果（无 pushed 字段）按普通命令处理 → ok，不误判成 warn', async () => {
+  const { describeActionResult } = await import(ACTION_FEEDBACK_MOD)
+
+  // 壳若返回一个没有三态契约的对象（如 unpair 的空对象），不能因为「不是 null」
+  // 就当成 pushed=false 去打黄字；它属于普通成功。
+  const fb = describeActionResult('unpair_device', {}, '已解除配对')
+  assert.equal(fb.tone, 'ok')
+  assert.equal(fb.text, '已解除配对')
+})
+
+test('端到端：点按钮后发起的命令，reason 行带上对应的色调类', async () => {
+  const { buttons } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') return ['check_update', 'open_settings', 'open_logs']
+          throw new Error('壳内业务失败')
+        },
+      },
+    },
+  })
+
+  buttons['open_logs'].btn.fire('click')
+  await flush()
+  // null → error：真失败才飘红
+  assert.match(buttons['open_logs'].reason.className, /is-error/)
+
+  const okCase = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['check_update', 'open_settings', 'open_logs']),
+  })
+  okCase.buttons['open_logs'].btn.fire('click')
+  await flush()
+  // 正常成功 → is-ok（不是默认的 warn）
+  assert.match(okCase.buttons['open_logs'].reason.className, /is-ok/)
+})
+
 test('DOM 桩与真实 index.html 结构一致（防止桩脱节导致假绿）', async () => {
   const html = await readFile(INDEX_HTML, 'utf8')
   const built = createDocument()

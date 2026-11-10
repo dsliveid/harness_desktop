@@ -168,7 +168,25 @@ button:disabled {
   margin: 0;
   min-height: 0;
   font-size: 12px;
+  /* 默认 warn：置灰原因的常规色调（「请升级客户端」这类需要看一眼、但不是故障） */
   color: var(--warn);
+}
+
+/*
+ * 操作反馈的三档色调（由 main.ts 的 applyActionResult 挂类）。
+ * 🔴 与状态卡「色条 / 文字分离」同一套约定：红字只留给真故障。
+ * 「配置已保存但未同步到执行引擎」是 is-warn（黄），不是 is-error。
+ */
+.reason.is-ok {
+  color: var(--ok);
+}
+
+.reason.is-warn {
+  color: var(--warn);
+}
+
+.reason.is-error {
+  color: var(--err);
 }
 
 .reason:empty {
