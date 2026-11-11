@@ -18,10 +18,24 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::daemon::{locate_runner, Daemon};
+use crate::daemon::{locate_runner, Daemon, ExitRecord};
 use crate::pairing::PairedDevice;
 use crate::profile::ProfileStore;
 use crate::vault::TokenVault;
+
+/// 反向收敛时用的会话失效原因（与 [`crate::commands::SessionFault`] 取值一致）。
+///
+/// 这里刻意**不**直接 use `commands::SessionFault`：`SessionFault` 定义在状态层
+/// （`commands`），而 `Bootstrap` 在它下层，直接引用会形成反向依赖环。
+/// 下层只表达「发生了服务端解绑」这一事实，具体记哪个枚举值由上层决定的回调负责 ——
+/// 因此这里只用一个轻量标记类型做参数，上层在闭包里映射。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokedReason {
+    /// 服务端主动解除了本设备绑定（WS terminal 帧 / `EXIT_REVOKED`）。
+    ServerUnpaired,
+    /// 只知道凭据不可用，没有服务端明确告知。
+    Generic,
+}
 
 /// `ensure_running` 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +126,17 @@ pub struct Bootstrap {
     /// 同时让单测可以不构造整个 `HostState`。
     policy_source:
         Option<std::sync::Arc<dyn Fn() -> hd_core::security::guard::Policy + Send + Sync>>,
+    /// 服务端解绑后的**反向收敛回调**（`Some` 时才会清会话与相位）。
+    ///
+    /// ## 为什么做成注入回调而不是直接依赖 `commands`
+    ///
+    /// 收敛要清 device_token / user_token / Cookie 并把相位切到 `NeedsPairing`，
+    /// 这些事实全在 `commands::HostState` 里；而 `Bootstrap` 在它**下层**。
+    /// 直接 use 会形成「编排层 ← 状态层」的反向依赖环。
+    ///
+    /// 注入 `Fn` 后：上层（`gui.rs`）把闭包接进 `HostState`，下层只管「什么时候该收敛」。
+    /// 未注入时（单测 / 旧调用方）退化为只做原有 repair（清档案 + 清令牌），行为不变。
+    revoked_handler: Option<std::sync::Arc<dyn Fn(RevokedReason) + Send + Sync>>,
 }
 
 impl Bootstrap {
@@ -132,7 +157,21 @@ impl Bootstrap {
             profile_store: None,
             protocol_version,
             policy_source: None,
+            revoked_handler: None,
         }
+    }
+
+    /// 注入「服务端解绑后的反向收敛」回调（生产由 `gui.rs` 接到 `HostState`）。
+    ///
+    /// 未注入时收敛只做原有 repair（清档案 + 清令牌），不清用户会话与相位 ——
+    /// 这让既有单测与旧调用方行为完全不变。
+    #[must_use]
+    pub fn with_revoked_handler(
+        mut self,
+        f: std::sync::Arc<dyn Fn(RevokedReason) + Send + Sync>,
+    ) -> Self {
+        self.revoked_handler = Some(f);
+        self
     }
 
     /// 注入「当前守卫策略」的取值函数（守护循环重启后重放用）。
@@ -320,10 +359,45 @@ impl Bootstrap {
             }
 
             // ③ 决策（纯逻辑，已单测穷举）。
+            //    先算「是否服务端解绑」——`on_exit` 会吞掉 `exit`（move）。
+            let revoked = revoked_reason_for_exit(&exit);
             let action = guard.on_exit(exit, crate::lifecycle::RunnerPhase::Running);
 
             match action {
                 GuardAction::Stop { phase, repair } => {
+                    // ③′ 服务端解绑的**反向收敛**（本轮修的真实 bug ②）：
+                    //   旧行为只清档案 + 设备令牌，用户仍看到「已配对但永远连不上」，
+                    //   必须自己想到去点「解除配对」才能恢复。
+                    if let Some(reason) = revoked {
+                        // 顺序：**先取地址再清档案**。清档案后地址只剩默认值，
+                        // 自定义服务端的 hg_sess Cookie 就清不掉了。
+                        let base_url = self.resolve_base_url();
+                        // 先走上层回调（清会话 + Cookie + 相位），失败不影响本地兜底。
+                        match self.revoked_handler.as_ref() {
+                            Some(handler) => handler(reason),
+                            None => {
+                                tracing::debug!(
+                                    "未注入反向收敛回调，仅执行原有 repair（清档案 + 清令牌）"
+                                );
+                            }
+                        }
+                        // 兜底下限：档案与设备令牌必须清掉（回调未注入时这是唯一动作）。
+                        if let Some(store) = self.profile_store.as_ref() {
+                            let _ = store.clear();
+                        }
+                        let _ = self.vault.clear();
+                        tracing::warn!(
+                            reason = ?reason,
+                            base_url = %base_url,
+                            "Runner 因服务端解绑而终止：本地凭据已清空，等待重新配对"
+                        );
+                        let phase = crate::lifecycle::RunnerPhase::NeedsPairing;
+                        self.daemon.stats().set_state(phase);
+                        return GuardAction::Stop {
+                            phase,
+                            repair: true,
+                        };
+                    }
                     if repair {
                         // 令牌已失效：清掉本地凭据，让用户重新配对。
                         // 顺序：先清档案再清令牌 —— 档案是明文，令牌在密钥链，
@@ -488,6 +562,41 @@ impl Bootstrap {
         }
         default_ws_url()
     }
+
+    /// 取「服务端 HTTP 基址」（反向收敛清 Cookie 用）。
+    ///
+    /// 必须在**清档案之前**调用：档案被清后只剩默认地址，自定义服务端的
+    /// `hg_sess` Cookie 就清不掉了。
+    fn resolve_base_url(&self) -> String {
+        if let Some(store) = self.profile_store.as_ref() {
+            match store.load() {
+                Ok(Some(p)) if p.is_usable() => return p.server_base_url,
+                Ok(_) => tracing::debug!("无可用配对档案，回退到默认服务端地址"),
+                Err(e) => tracing::warn!(error = %e, "读取配对档案失败，回退到默认地址"),
+            }
+        }
+        default_http_url()
+    }
+}
+
+/// 由一次退出记录判定「是否属于服务端解绑」的收敛（纯函数，可穷举单测）。
+///
+/// ## 为什么判定放在这里而不是复用 `commands::plan_revoked_convergence`
+///
+/// 那个函数吃的是「退出码 + WS 终止帧错误码」，而 `ExitRecord` 只有退出码 ——
+/// 守护循环是**唯一**能看到 `ExitRecord` 的地方。这里只按退出码契约判定：
+/// `EXIT_REVOKED` 按 `hd_protocol::exit_code` 的定义只由 `device.revoked` 产生，
+/// 因此它就是「服务端解绑」的可靠信号。
+///
+/// `EXIT_NO_AUTH`（本地配置问题）**不算**：那多半是宿主写错了令牌/地址，
+/// 说成「服务端解绑了你」会让用户跑去服务端白找一遍。
+#[must_use]
+pub fn revoked_reason_for_exit(exit: &ExitRecord) -> Option<RevokedReason> {
+    let code = exit.code.and_then(|c| u8::try_from(c).ok());
+    if code == Some(hd_protocol::exit_code::EXIT_REVOKED) {
+        return Some(RevokedReason::ServerUnpaired);
+    }
+    None
 }
 
 /// 默认服务端地址（档案缺失时的回退值）。

@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "baseline-shell",
+  "description": "基线页（本地 UI）与远程服务端 UI 的最小 IPC 面：全部为低危动作（导航/查询/会话读写）。远程域授权仅覆盖壳自有命令（core:default 之外的 app 命令默认全收 —— Tauri 2 中 app 自定义命令不走 permission 白名单，remote 才是这道闸）。",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://*", "https://*"]
+  },
+  "local": true,
+  "permissions": [
+    "core:default"
+  ]
+}

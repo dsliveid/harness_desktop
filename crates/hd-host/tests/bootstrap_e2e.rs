@@ -102,6 +102,8 @@ async fn pair_then_runner_is_spawned() {
         ws_url,
         protocol_version: 1,
         server_base_url: "http://127.0.0.1:1".into(),
+        // 端到端用例只验证「先落 token 再拉起」：不涉及会话授权。
+        session: None,
     };
     // 用显式 runner 路径，避免依赖 exe_name 搜索
     let boot = boot.with_explicit_runner(Some(exe));
