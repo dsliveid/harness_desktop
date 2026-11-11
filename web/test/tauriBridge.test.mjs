@@ -14,6 +14,8 @@ import {
   COMMANDS,
   NO_TAURI_REASON,
   call,
+  callResult,
+  hasTauriRuntime,
   normalizeSupported,
   probe,
   probeMany,
@@ -42,10 +44,12 @@ beforeEach(() => {
   invokeLog.length = 0
   resetCapabilityCache()
   delete globalThis.__TAURI__
+  delete globalThis.__TAURI_INTERNALS__
 })
 
 afterEach(() => {
   delete globalThis.__TAURI__
+  delete globalThis.__TAURI_INTERNALS__
   resetCapabilityCache()
 })
 
@@ -148,4 +152,129 @@ test('normalizeSupported：兼容数组与 {supported} / {commands} 三种形状
   // 无法识别一律返回 null（调用方据此全降级）
   assert.equal(normalizeSupported('nope'), null)
   assert.equal(normalizeSupported(null), null)
+})
+
+/* ============ 运行形态判定（🔴 回归：withGlobalTauri 缺失事故） ============ */
+
+test('hasTauriRuntime：无任何壳全局对象时为 false（真浏览器端）', () => {
+  assert.equal(hasTauriRuntime(), false)
+})
+
+test('hasTauriRuntime：__TAURI__.core.invoke 存在时为 true（v2 公开入口）', () => {
+  installFakeTauri(() => null)
+  assert.equal(hasTauriRuntime(), true)
+})
+
+test('hasTauriRuntime：仅 v1 形状 __TAURI__.tauri.invoke 也算壳内', () => {
+  globalThis.__TAURI__ = { tauri: { invoke: async () => null } }
+  assert.equal(hasTauriRuntime(), true)
+})
+
+test('hasTauriRuntime：__TAURI__ 存在但没有 invoke 时不算壳内（不能误判可用）', () => {
+  // 空壳对象是最危险的形态：看着有 __TAURI__，实际调不通任何命令。
+  // 若这里返回 true，按钮就会放开点击，点下去才失败 —— 正是要杜绝的体验。
+  globalThis.__TAURI__ = {}
+  assert.equal(hasTauriRuntime(), false)
+})
+
+test('🔴 回归：未开 withGlobalTauri 时仅靠 __TAURI_INTERNALS__ 也能用（本次事故根因）', async () => {
+  // 事故现场：tauri.conf.json 缺 app.withGlobalTauri（Tauri 2 默认 false），
+  // 于是 window.__TAURI__ 根本不存在，而 __TAURI_INTERNALS__ 由初始化脚本无条件注入。
+  // 修复前这里会整体降级成「当前为浏览器端」，所有本机能力按钮一起置灰。
+  assert.equal(globalThis.__TAURI__, undefined)
+  globalThis.__TAURI_INTERNALS__ = {
+    invoke: async (cmd) => {
+      invokeLog.push(cmd)
+      if (cmd === COMMANDS.listCommands) return [COMMANDS.runnerStatus]
+      return { state: 'running' }
+    },
+  }
+
+  assert.equal(hasTauriRuntime(), true)
+
+  const state = await probe(COMMANDS.runnerStatus)
+  assert.equal(state.ok, true)
+  // 关键：不能再落到「浏览器端」那条降级分支上
+  assert.notEqual(state.reason, NO_TAURI_REASON)
+
+  const raw = await call(COMMANDS.runnerStatus)
+  assert.deepEqual(raw, { state: 'running' })
+})
+
+test('__TAURI__ 与 __TAURI_INTERNALS__ 同时存在时优先用公开入口', async () => {
+  // 公开入口才是稳定契约；内部 API 仅兜底。两者共存时必须先试公开的那个。
+  installFakeTauri(() => 'from-public')
+  globalThis.__TAURI_INTERNALS__ = { invoke: async () => 'from-internals' }
+
+  assert.equal(await call(COMMANDS.checkUpdate), 'from-public')
+})
+
+test('__TAURI_INTERNALS__.invoke 的 this 被绑定（内部实现可依赖接收者）', async () => {
+  // 内部实现若用 this 存状态，裸取函数再调用会静默丢接收者 → 报错。
+  // 桥接层 bind 过，这里用依赖 this 的实现来验。
+  globalThis.__TAURI_INTERNALS__ = {
+    marker: 'bound-ok',
+    async invoke() {
+      return this.marker
+    },
+  }
+  assert.equal(await call(COMMANDS.checkUpdate), 'bound-ok')
+})
+
+/* ============ callResult：分离「失败」与「成功返回 unit」 ============ */
+
+test('🔴 回归：命令成功返回 null（Rust unit）必须判为 ok，不能报失败', async () => {
+  // 事故现场：unpair_device 的 Rust 签名是 `Result<(), String>`，
+  // 成功时序列化就是 null。旧 call() 用 null 同时表示「失败」和「成功返回 unit」，
+  // 导致后端的「已解除配对」日志与前端「命令未成功」提示直接矛盾。
+  installFakeTauri(() => null)
+
+  const r = await callResult(COMMANDS.unpairDevice)
+
+  assert.equal(r.ok, true, '成功返回 null 必须是 ok:true')
+  assert.equal(r.value, null)
+})
+
+test('callResult：无壳时 ok:false 并带「浏览器端」原因（与 call 的 null 区分开）', async () => {
+  const r = await callResult(COMMANDS.checkUpdate)
+
+  assert.equal(r.ok, false)
+  assert.equal(r.reason, NO_TAURI_REASON)
+})
+
+test('callResult：invoke 抛错时 ok:false 且 reason 可读，绝不 throw', async () => {
+  installFakeTauri(() => {
+    throw new Error('Command unpair_device not found')
+  })
+
+  const r = await callResult(COMMANDS.unpairDevice)
+
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /unpair_device/)
+})
+
+test('callResult：字符串型 reject（Err(String) 命令）也能转成人话', async () => {
+  installFakeTauri(() => {
+    // Tauri 对 `Err(String)` 的 command，reject 值就是那个字符串
+    throw '清除设备令牌失败：密钥链被锁定'
+  })
+
+  const r = await callResult(COMMANDS.unpairDevice)
+
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /密钥链被锁定/)
+})
+
+test('callResult：成功返回对象时原样透传', async () => {
+  installFakeTauri(() => ({ paired: true, online: true, device_id: 'dev-x' }))
+
+  const r = await callResult(COMMANDS.deviceStatus)
+
+  assert.equal(r.ok, true)
+  assert.deepEqual(r.value, { paired: true, online: true, device_id: 'dev-x' })
+})
+
+test('call 仍保持旧契约：成功返回 null 时给 null（兼容既有调用方）', async () => {
+  installFakeTauri(() => null)
+  assert.equal(await call(COMMANDS.unpairDevice), null)
 })

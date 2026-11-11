@@ -56,11 +56,129 @@
       </section>
 
       <!--
+        配对表单：未配对时显示，已配对时隐藏（与下方解除配对区块互斥）。
+
+        为什么服务端地址要单独一项：壳的 pair_device 支持 server_base_url 可选参数
+        （缺省回落 http://127.0.0.1:5611）。没有这一项，只要服务端不跑在本机 5611
+        端口，用户就完全无法配对 —— 局域网/云服务器部署直接不可用。
+        默认值预填并允许留空（留空 = 用默认），本机自用场景下用户直接点「立即配对」即可。
+      -->
+      <section id="pairing" class="card actions" hidden>
+        <strong class="line-title">设备配对</strong>
+        <p class="hint">本机尚未绑定设备。输入配对码完成绑定，绑定后执行引擎会自动启动。</p>
+
+        <div class="field">
+          <label for="pair-server">服务端地址</label>
+          <input
+            id="pair-server"
+            type="text"
+            inputmode="url"
+            autocomplete="off"
+            spellcheck="false"
+            value="http://127.0.0.1:5611"
+          />
+          <span class="field-hint">留空则用默认；跨机部署填服务端 IP，如 192.168.1.5:5611</span>
+        </div>
+
+        <div class="field">
+          <label for="pair-code">配对码</label>
+          <input
+            id="pair-code"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            maxlength="14"
+            placeholder="6-12 位大写字母或数字"
+          />
+          <span class="field-hint">由服务端生成，仅含大写字母与数字</span>
+        </div>
+
+        <div class="field">
+          <label for="pair-name">设备名称</label>
+          <input
+            id="pair-name"
+            type="text"
+            autocomplete="off"
+            maxlength="40"
+            value="harness-desktop"
+          />
+          <span class="field-hint">仅用于服务端展示，可留空使用默认值</span>
+        </div>
+
+        <div class="action">
+          <button type="button" data-cmd="pair_device" disabled>立即配对</button>
+          <p class="reason" data-reason-for="pair_device"></p>
+        </div>
+      </section>
+
+      <!--
+        原生登录表单（契约一，2026-11）：已配对未登录时显示。
+
+        为什么登录表单在基线页而不是 Web UI 里：对齐移动端「登录只在原生」铁律。
+        网页里登录产生的会话只进 WebView Cookie、不回写壳的密钥链 —— 原生与页面
+        两套账（移动端已修过的真实缺陷）。由壳发起登录：密码不经 JS 堆以外的
+        任何存储，令牌进密钥链，登出/自续状态机保持单一事实源。
+
+        显隐由 main.ts 按 device_status 驱动（plan_baseline_stage 判定），
+        与配对表单互斥：未配对先配对，已配对未登录才显示本卡。
+      -->
+      <section id="sign-in" class="card actions" hidden>
+        <strong class="line-title">账号登录</strong>
+        <p class="hint">本机已绑定设备，但尚未登录账号。登录后进入主界面无需再次登录。</p>
+
+        <div class="field">
+          <label for="sign-username">用户名</label>
+          <input
+            id="sign-username"
+            type="text"
+            autocomplete="username"
+            spellcheck="false"
+            maxlength="64"
+          />
+        </div>
+
+        <div class="field">
+          <label for="sign-password">密码</label>
+          <input id="sign-password" type="password" autocomplete="current-password" />
+          <span class="field-hint">密码只经 IPC 提交给壳，不落任何本地存储或日志</span>
+        </div>
+
+        <div class="action">
+          <button type="button" data-cmd="sign_in" disabled>登录</button>
+          <p class="reason" data-reason-for="sign_in"></p>
+        </div>
+      </section>
+
+      <!--
         解除配对是**不可逆**操作（清掉密钥链令牌，只能重走配对码流程），
         因此单独一块、带说明与二次确认，不和日常按钮混在一起。
+
+        🔴 id 存在的理由：这张卡片的标题与文案由 main.ts 按「是否已配对」动态渲染。
+        原先它是纯静态的，导致「本机没配对却摆着一个可点的解除配对」—— 用户点下去
+        才发现没意义。判定逻辑见 src/desktop/deviceBond.ts。
+        已配对时才显示（与上方配对表单互斥）。
+
+        「退出登录」与「解除配对」严格正交（对齐移动端 signOut / resetPairing）：
+        登出只清会话、保留设备绑定；解绑才回到需要配对。
+        两者的区别必须写在按钮旁边，否则用户想换账号时会误点解绑。
       -->
-      <section class="card actions danger">
+      <section id="device-binding" class="card actions danger" hidden>
         <strong class="line-title">设备绑定</strong>
+
+        <!-- 进入主界面（手动兜底入口，2026-11）：配对成功/启动自续会自动导航到
+             服务端 Web UI；自动导航失败或用户关掉过，从这里重进。恒可探测。 -->
+        <div class="action">
+          <button type="button" data-cmd="open_web_ui" disabled>进入主界面</button>
+          <p class="reason" data-reason-for="open_web_ui"></p>
+          <p class="hint">打开服务端 Web UI（已配对时自动免登录）。</p>
+        </div>
+
+        <div class="action" id="sign-out-row" hidden>
+          <button type="button" data-cmd="sign_out" disabled>退出登录</button>
+          <p class="reason" data-reason-for="sign_out"></p>
+          <p class="hint">仅退出账号，设备保持绑定，执行引擎继续在线。</p>
+        </div>
+
         <div class="action">
           <button type="button" data-cmd="unpair_device" disabled>解除配对</button>
           <p class="reason" data-reason-for="unpair_device"></p>

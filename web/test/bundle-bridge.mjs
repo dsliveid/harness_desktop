@@ -25,6 +25,10 @@ const entries = [
   { src: '../src/desktop/runnerPhase.ts', out: '.build/runnerPhase.mjs' },
   // 操作反馈三态判定（ok / warn / error）：纯逻辑，直接 import 做穷举单测
   { src: '../src/desktop/actionFeedback.ts', out: '.build/actionFeedback.mjs' },
+  // 设备绑定状态解析与按钮门禁：纯逻辑，穷举「已配对 / 未配对 / 读不出」三态
+  { src: '../src/desktop/deviceBond.ts', out: '.build/deviceBond.mjs' },
+  // 配对表单判据：配对码归一、服务端地址归一、整表单校验
+  { src: '../src/desktop/pairingForm.ts', out: '.build/pairingForm.mjs' },
   { src: '../src/baseline/main.ts', out: '.build/baseline.mjs' },
 ]
 
@@ -44,5 +48,5 @@ for (const { src, out } of entries) {
 }
 
 console.log(
-  '[test] 已打包 test/.build/{tauriBridge,runnerPhase,actionFeedback,baseline}.mjs',
+  '[test] 已打包 test/.build/{tauriBridge,runnerPhase,actionFeedback,deviceBond,baseline}.mjs',
 )

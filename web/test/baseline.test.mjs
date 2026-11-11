@@ -31,11 +31,14 @@ async function flush(rounds = 6) {
  * 用递增 query 破 ESM 模块缓存，否则第二次 import 会拿到上一用例的副作用。
  */
 let caseSeq = 0
-async function loadBaseline({ fetchImpl, tauri }) {
+async function loadBaseline({ fetchImpl, tauri, confirmImpl }) {
   const { doc, buttons, server, capability, diag } = createDocument()
   globalThis.document = doc
   globalThis.location = { origin: 'http://127.0.0.1:7777', href: 'http://127.0.0.1:7777/' }
   globalThis.fetch = fetchImpl
+  // 基线界面用 confirm 做不可逆操作的二次确认。Node 里没有它，
+  // 不桩就会在点「解除配对」时抛 ReferenceError（与真实浏览器行为不符）。
+  globalThis.confirm = confirmImpl ?? (() => true)
   if (tauri) globalThis.__TAURI__ = tauri
   else delete globalThis.__TAURI__
 
@@ -44,15 +47,63 @@ async function loadBaseline({ fetchImpl, tauri }) {
   // readyState=loading → 走 DOMContentLoaded 分支（与真实浏览器一致）
   doc.fire('DOMContentLoaded')
   await flush()
-  return { doc, buttons, server, capability, diag }
+  // 表单区块与输入框：供配对相关用例断言显隐与取值
+  const pairingSection = doc.querySelector('#pairing')
+  const bindingSection = doc.querySelector('#device-binding')
+  const signInSection = doc.querySelector('#sign-in')
+  const signOutRow = doc.querySelector('#sign-out-row')
+  const pairServer = doc.querySelector('#pair-server')
+  const pairCode = doc.querySelector('#pair-code')
+  const pairName = doc.querySelector('#pair-name')
+  const signUsername = doc.querySelector('#sign-username')
+  const signPassword = doc.querySelector('#sign-password')
+  return {
+    doc,
+    buttons,
+    server,
+    capability,
+    diag,
+    pairingSection,
+    bindingSection,
+    signInSection,
+    signOutRow,
+    pairServer,
+    pairCode,
+    pairName,
+    signUsername,
+    signPassword,
+  }
 }
 
-/** 造一个假壳：supported 决定能力清单，行为由各用例通过 extra 补充 */
-function fakeTauri(supported) {
+/**
+ * 造一个假壳：supported 决定能力清单，行为由各用例通过 extra 补充。
+ *
+ * ⚠️ `device_status` 必须返回**符合契约**的对象（含布尔 `paired`），不能落到默认的
+ * `{ ok: true, cmd }`：那会被 `parseDeviceStatus` 判为「读不出」，从而把解除配对置灰，
+ * 让「壳能力齐备 ⇒ 全部可点」这类用例意外失败（且失败原因与用例意图无关）。
+ *
+ * `signedIn` 与 `paired` **正交**：默认 false 表示「已配对但未自动登录」这个常态，
+ * 与后端契约一致（旧服务端不签发会话）。
+ */
+function fakeTauri(
+  supported,
+  { paired = false, deviceId = null, online = false, signedIn = false, userLabel = null } = {},
+) {
   return {
     core: {
       invoke: async (cmd) => {
         if (cmd === 'list_commands') return supported
+        if (cmd === 'device_status') {
+          return {
+            paired,
+            online,
+            device_id: deviceId,
+            app_version: '0.1.0',
+            protocol_ok: true,
+            signed_in: signedIn,
+            user_label: userLabel,
+          }
+        }
         return { ok: true, cmd }
       },
     },
@@ -169,6 +220,26 @@ test('端到端：点按钮后发起的命令，reason 行带上对应的色调�
   assert.match(okCase.buttons['open_logs'].reason.className, /is-ok/)
 })
 
+test('进入主界面：能力齐备时可点、点击发起 open_web_ui 并展示反馈文案', async () => {
+  const { buttons, capability } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(
+      ['check_update', 'open_settings', 'open_logs', 'open_web_ui', 'unpair_device', 'pair_device', 'sign_out', 'runner_status'],
+      { paired: true, deviceId: 'dev-1', online: true, signedIn: true, userLabel: 'alice' },
+    ),
+  })
+
+  // 未点击前：无 reason（门禁全过）
+  assert.equal(buttons['open_web_ui'].btn.disabled, false)
+
+  buttons['open_web_ui'].btn.fire('click')
+  await flush()
+  // 成功 → is-ok + 反馈文案（manual fallback 入口的存在性回归）
+  assert.match(buttons['open_web_ui'].reason.className, /is-ok/)
+  assert.match(buttons['open_web_ui'].reason.textContent, /主界面/)
+  assert.ok(capability)
+})
+
 test('DOM 桩与真实 index.html 结构一致（防止桩脱节导致假绿）', async () => {
   const html = await readFile(INDEX_HTML, 'utf8')
   const built = createDocument()
@@ -277,25 +348,77 @@ test('壳缺命令：只有缺失项置灰且 reason 带命令名，其余可点
   assert.equal(capability.dataset['state'], 'warn')
 })
 
-test('壳能力齐备：全部可点且不显示任何 reason', async () => {
+test('壳能力齐备且已配对：全部可点且不显示任何 reason', async () => {
   const { buttons, capability } = await loadBaseline({
     fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
     // 必须列出界面上的**全部** data-cmd，否则 `summarizeCapability` 会因
     // 「有按钮不可用」而降级为 warn —— 这是真实行为，不是测试放宽。
-    tauri: fakeTauri([
-      'check_update',
-      'open_settings',
-      'open_logs',
-      'unpair_device',
-      'runner_status',
-    ]),
+    // 注意含 pair_device / sign_out：它们也是界面按钮，漏列会让能力汇总降级。
+    tauri: fakeTauri(
+      [
+        'check_update',
+        'open_settings',
+        'open_logs',
+        'open_web_ui',
+        'sign_in',
+        'unpair_device',
+        'pair_device',
+        'sign_out',
+        'runner_status',
+      ],
+      // 解除配对要可点，前置条件是**已配对**（业务门禁，见 deviceBond.ts）
+      { paired: true, deviceId: 'dev-1', online: true, signedIn: true, userLabel: 'alice' },
+    ),
   })
 
-  for (const cmd of ['check_update', 'open_settings', 'open_logs', 'unpair_device']) {
+  for (const cmd of [
+    'check_update',
+    'open_settings',
+    'open_logs',
+    'open_web_ui',
+    'unpair_device',
+    'sign_out',
+  ]) {
     assert.equal(buttons[cmd].btn.disabled, false, `${cmd} 应可点`)
     assert.equal(buttons[cmd].reason.textContent, '')
   }
   assert.equal(capability.dataset['state'], 'ok')
+})
+
+test('🔴 回归：壳能力齐备但**未配对**时，解除配对必须置灰并引导去配对', async () => {
+  // 这就是「明明没配对，为什么就到取消配对界面了」的直接防线。
+  // 修复前：只要壳支持 unpair_device 就放开点击，与是否配对毫无关系。
+  const { buttons } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['check_update', 'open_settings', 'open_logs', 'unpair_device'], {
+      paired: false,
+    }),
+  })
+
+  assert.equal(buttons['unpair_device'].btn.disabled, true, '未配对时解除配对不可点')
+  assert.match(buttons['unpair_device'].reason.textContent, /未配对/)
+  // 其他按钮不受业务门禁影响
+  assert.equal(buttons['check_update'].btn.disabled, false)
+})
+
+test('壳能力齐备但 device_status 读不出：解除配对同样置灰（fail-closed）', async () => {
+  const { buttons } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') {
+            return ['check_update', 'open_settings', 'open_logs', 'unpair_device']
+          }
+          // 形状不合契约（缺 paired）→ 归一成 unknown → 不放行
+          return { something: 'else' }
+        },
+      },
+    },
+  })
+
+  assert.equal(buttons['unpair_device'].btn.disabled, true, '读不出状态时不得放行解除配对')
+  assert.match(buttons['unpair_device'].reason.textContent, /paired|未知|不可识别/)
 })
 
 test('点击可用按钮：调用成功后在 reason 行给出人话反馈', async () => {
@@ -309,7 +432,445 @@ test('点击可用按钮：调用成功后在 reason 行给出人话反馈', asy
   assert.match(buttons['open_settings'].reason.textContent, /已请求打开设置页/)
 })
 
-test('点击可用按钮但壳内失败：反馈「未成功」而不是把异常抛到界面', async () => {
+/* ============ 配对界面（本次补齐的核心需求） ============ */
+
+test('🔴 未配对时：配对表单可见、解除配对区块隐藏', async () => {
+  // 需求：界面必须有配对入口，否则用户看到「请先输入配对码」却无处可输。
+  const { pairingSection, bindingSection } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['check_update', 'pair_device', 'unpair_device'], { paired: false }),
+  })
+
+  assert.equal(pairingSection.hidden, false, '未配对时配对表单必须可见')
+  assert.equal(bindingSection.hidden, true, '未配对时解除配对区块必须隐藏')
+})
+
+test('🔴 已配对时：解除配对区块可见、配对表单隐藏（两者互斥）', async () => {
+  const { pairingSection, bindingSection } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['check_update', 'pair_device', 'unpair_device'], {
+      paired: true,
+      deviceId: 'dev-9',
+      online: true,
+    }),
+  })
+
+  assert.equal(pairingSection.hidden, true, '已配对时不该再显示配对表单')
+  assert.equal(bindingSection.hidden, false)
+})
+
+/* ============ 原生登录（契约一，2026-11） ============ */
+
+test('🔴 已配对未登录时：登录卡片可见、配对表单与登出隐藏', async () => {
+  const { pairingSection, signInSection, bindingSection, signOutRow } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['check_update', 'sign_in', 'unpair_device', 'sign_out'], {
+      paired: true,
+      deviceId: 'dev-9',
+      signedIn: false,
+    }),
+  })
+
+  assert.equal(signInSection.hidden, false, '已配对未登录必须显示原生登录表单')
+  assert.equal(pairingSection.hidden, true, '已配对时不再显示配对表单')
+  assert.equal(bindingSection.hidden, false, '解除配对仍可见（配对态未变）')
+  assert.equal(signOutRow.hidden, true, '未登录时没有「退出登录」可点')
+})
+
+test('🔴 已配对已登录时：登录卡片隐藏（没有可点的登录入口）', async () => {
+  const { signInSection } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['check_update', 'sign_in', 'unpair_device', 'sign_out'], {
+      paired: true,
+      deviceId: 'dev-9',
+      signedIn: true,
+      userLabel: 'alice',
+    }),
+  })
+
+  assert.equal(signInSection.hidden, true, '已登录不该再显示登录表单')
+})
+
+test('🔴 未配对时：登录卡片隐藏（先配对，配对码才是获取会话的入口）', async () => {
+  const { signInSection, pairingSection } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['check_update', 'sign_in', 'unpair_device', 'sign_out'], {
+      paired: false,
+    }),
+  })
+
+  assert.equal(signInSection.hidden, true, '未配对时不该显示登录表单')
+  assert.equal(pairingSection.hidden, false, '未配对时应显示配对表单')
+})
+
+test('🔴 登录提交：空输入被前端拦截（不发起 IPC）', async () => {
+  let called = false
+  const { buttons, signUsername } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') return ['sign_in']
+          if (cmd === 'device_status') {
+            return { paired: true, online: true, device_id: 'dev-9', signed_in: false }
+          }
+          if (cmd === 'sign_in') {
+            called = true
+            return { signed_in: true, user_label: 'op' }
+          }
+          return null
+        },
+      },
+    },
+  })
+
+  signUsername.value = 'op'
+  signUsername.fire('input')
+  await flush()
+  buttons['sign_in'].btn.fire('click')
+  await flush()
+
+  assert.equal(called, false, '密码为空时不应发起登录请求')
+  assert.match(buttons['sign_in'].reason.textContent, /请输入密码/)
+})
+
+test('🔴 登录提交：参数为 {username, password}，成功后文案带账号名', async () => {
+  let captured = null
+  let signedIn = false
+  const { buttons, signUsername, signPassword } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd, args) => {
+          if (cmd === 'list_commands') return ['sign_in', 'unpair_device']
+          if (cmd === 'device_status') {
+            return {
+              paired: true,
+              online: true,
+              device_id: 'dev-9',
+              signed_in: signedIn,
+              user_label: signedIn ? 'op' : null,
+            }
+          }
+          if (cmd === 'sign_in') {
+            captured = args
+            signedIn = true
+            return { signed_in: true, user_label: '操作员' }
+          }
+          return null
+        },
+      },
+    },
+  })
+
+  signUsername.value = 'op'
+  signPassword.value = 'secret'
+  signPassword.fire('input')
+  await flush()
+  buttons['sign_in'].btn.fire('click')
+  await flush()
+
+  assert.ok(captured, '应真的调用了 sign_in')
+  assert.equal(captured.username, 'op')
+  assert.equal(captured.password, 'secret')
+  assert.match(buttons['sign_in'].reason.textContent, /操作员/)
+})
+
+test('🔴 登录失败：服务端拒绝原文上抛（保留错误码，色调 error）', async () => {
+  const { buttons, signUsername, signPassword } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') return ['sign_in']
+          if (cmd === 'device_status') {
+            return { paired: true, online: true, device_id: 'dev-9', signed_in: false }
+          }
+          if (cmd === 'sign_in') throw new Error('登录失败（auth.invalid_credentials）：用户名或密码错误')
+          return null
+        },
+      },
+    },
+  })
+
+  signUsername.value = 'op'
+  signPassword.value = 'bad'
+  signPassword.fire('input')
+  await flush()
+  buttons['sign_in'].btn.fire('click')
+  await flush()
+
+  const text = buttons['sign_in'].reason.textContent
+  assert.match(text, /用户名或密码错误/)
+})
+
+
+test('服务端地址：默认值已预填（跨机部署才需要改）', async () => {
+  const { pairServer } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['pair_device'], { paired: false }),
+  })
+
+  assert.equal(pairServer.value, 'http://127.0.0.1:5611')
+})
+
+test('配对按钮：未填配对码时置灰，并说明原因', async () => {
+  const { buttons } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['pair_device'], { paired: false }),
+  })
+
+  assert.equal(buttons['pair_device'].btn.disabled, true, '空配对码不得放行')
+  assert.match(buttons['pair_device'].reason.textContent, /配对码/)
+})
+
+test('配对按钮：填入合法配对码后放开点击', async () => {
+  const { buttons, pairCode } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['pair_device'], { paired: false }),
+  })
+
+  pairCode.value = 'ABC123'
+  pairCode.fire('input')
+  await flush()
+
+  assert.equal(buttons['pair_device'].btn.disabled, false, '合法输入应放行')
+})
+
+test('配对码输入即时归一：小写与连字符自动处理', async () => {
+  const { pairCode } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['pair_device'], { paired: false }),
+  })
+
+  pairCode.value = 'ab12-cd34'
+  pairCode.fire('input')
+  await flush()
+
+  // 用户看到的就是将要提交的值，避免「看着输对了却被后端拒」
+  assert.equal(pairCode.value, 'AB12CD34')
+})
+
+test('🔴 配对提交：参数名必须是 serverBaseUrl（Tauri 的 camelCase 映射）', async () => {
+  // 传错名字的后果是参数被静默忽略 → 地址永远回落默认值，
+  // 跨机部署静默失效且极难查。这里直接断言实际发出的参数。
+  let captured = null
+  let paired = false
+  const { buttons, pairCode, pairServer, pairName } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd, args) => {
+          if (cmd === 'list_commands') return ['pair_device', 'unpair_device']
+          if (cmd === 'device_status') {
+            return { paired, online: false, device_id: paired ? 'dev-new' : null }
+          }
+          if (cmd === 'pair_device') {
+            captured = args
+            paired = true
+            return { accepted: true, message: '配对成功，执行引擎已启动' }
+          }
+          return null
+        },
+      },
+    },
+  })
+
+  pairServer.value = '192.168.1.5:9000'
+  pairCode.value = 'ABC123'
+  pairName.value = 'my-pc'
+  pairCode.fire('input')
+  await flush()
+
+  buttons['pair_device'].btn.fire('click')
+  await flush()
+
+  assert.ok(captured, '应真的调用了 pair_device')
+  assert.equal(captured.code, 'ABC123')
+  assert.equal(captured.name, 'my-pc')
+  // 🔴 关键：参数名是 camelCase，且地址已归一
+  assert.equal(captured.serverBaseUrl, 'http://192.168.1.5:9000')
+})
+
+test('配对成功后：界面切到已绑定（表单隐藏、解除配对可见）', async () => {
+  let paired = false
+  const { buttons, pairingSection, bindingSection, pairCode } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') return ['pair_device', 'unpair_device']
+          if (cmd === 'device_status') {
+            return { paired, online: true, device_id: paired ? 'dev-new' : null }
+          }
+          if (cmd === 'pair_device') {
+            paired = true
+            return { accepted: true, message: '配对成功，执行引擎已启动' }
+          }
+          return null
+        },
+      },
+    },
+  })
+
+  pairCode.value = 'ABC123'
+  pairCode.fire('input')
+  await flush()
+  buttons['pair_device'].btn.fire('click')
+  await flush()
+
+  assert.equal(pairingSection.hidden, true, '配对成功后表单应隐藏')
+  assert.equal(bindingSection.hidden, false, '配对成功后解除配对区块应出现')
+})
+
+test('配对失败：reason 行给出具体原因，且表单仍可见可重试', async () => {
+  const { buttons, pairingSection, pairCode } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') return ['pair_device']
+          if (cmd === 'device_status') return { paired: false, online: false }
+          if (cmd === 'pair_device') throw '配对码无效或已过期'
+          return null
+        },
+      },
+    },
+  })
+
+  pairCode.value = 'ABC123'
+  pairCode.fire('input')
+  await flush()
+  buttons['pair_device'].btn.fire('click')
+  await flush()
+
+  assert.match(buttons['pair_device'].reason.textContent, /配对码无效|过期/)
+  assert.equal(pairingSection.hidden, false, '失败后表单必须保留，供用户重试')
+})
+
+/* ============ 退出登录（sign_out，与解绑正交） ============ */
+
+test('🔴 已配对且已登录：显示「退出登录」且可点；解绑也同时可用（两者正交）', async () => {
+  // 登出只清会话、保留设备绑定，因此与解绑**必须同时存在**。
+  // 若把登出做成「连设备一起解绑」，用户只想换账号却得重新找配对码
+  // —— 这是移动端已踩过并修正的坑。
+  const { buttons, signOutRow } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['unpair_device', 'sign_out'], {
+      paired: true,
+      deviceId: 'dev-1',
+      online: true,
+      signedIn: true,
+      userLabel: 'alice',
+    }),
+  })
+
+  assert.equal(signOutRow.hidden, false, '已登录时应显示退出登录')
+  assert.equal(buttons['sign_out'].btn.disabled, false, '登出应可点')
+  assert.equal(buttons['unpair_device'].btn.disabled, false, '解绑同样可用（正交，不互斥）')
+})
+
+test('🔴 已配对但未登录：隐藏「退出登录」（没登录就无从登出）', async () => {
+  const { buttons, signOutRow } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['unpair_device', 'sign_out'], {
+      paired: true,
+      deviceId: 'dev-1',
+      online: true,
+      signedIn: false,
+    }),
+  })
+
+  assert.equal(signOutRow.hidden, true, '未登录不得显示登出按钮')
+  // 解绑不受登录态影响：它只要求已配对
+  assert.equal(buttons['unpair_device'].btn.disabled, false)
+})
+
+test('未配对：隐藏「退出登录」', async () => {
+  const { signOutRow } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: fakeTauri(['unpair_device', 'sign_out'], { paired: false }),
+  })
+
+  assert.equal(signOutRow.hidden, true)
+})
+
+test('🔴 登出成功后：设备仍绑定（解绑按钮仍在），但登出按钮消失', async () => {
+  // 这是「登出 ≠ 解绑」最关键的行为断言：登出后设备仍是已配对状态。
+  let signedIn = true
+  const { buttons, signOutRow, bindingSection } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') return ['unpair_device', 'sign_out']
+          if (cmd === 'device_status') {
+            return { paired: true, online: true, device_id: 'dev-1', signed_in: signedIn }
+          }
+          if (cmd === 'sign_out') {
+            signedIn = false
+            return null // Result<(), _> 成功返回 unit
+          }
+          return null
+        },
+      },
+    },
+  })
+
+  assert.equal(signOutRow.hidden, false)
+  buttons['sign_out'].btn.fire('click')
+  await flush()
+
+  // 关键断言：**没有**触发解绑，设备仍绑定
+  assert.equal(bindingSection.hidden, false, '登出后设备绑定区块仍应可见')
+  assert.equal(signOutRow.hidden, true, '登出后登出按钮应消失')
+  assert.equal(buttons['unpair_device'].btn.disabled, false, '设备仍配对，解绑仍可用')
+})
+
+test('登出成功后 reason 行显示登出结果（不被刷新抹掉）', async () => {
+  let signedIn = true
+  const { buttons } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') return ['unpair_device', 'sign_out']
+          if (cmd === 'device_status') {
+            return { paired: true, online: true, device_id: 'dev-1', signed_in: signedIn }
+          }
+          if (cmd === 'sign_out') {
+            signedIn = false
+            return null
+          }
+          return null
+        },
+      },
+    },
+  })
+
+  buttons['sign_out'].btn.fire('click')
+  await flush()
+
+  assert.match(buttons['sign_out'].reason.textContent, /已退出登录/)
+})
+
+test('旧壳无 sign_out：按钮置灰并说明需升级（不误报为可用）', async () => {
+  const { buttons } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    // 已登录但壳不支持 sign_out
+    tauri: fakeTauri(['unpair_device'], {
+      paired: true,
+      deviceId: 'dev-1',
+      online: true,
+      signedIn: true,
+    }),
+  })
+
+  assert.equal(buttons['sign_out'].btn.disabled, true)
+  assert.match(buttons['sign_out'].reason.textContent, /sign_out|升级/)
+})
+
+test('点击可用按钮但壳内失败：反馈具体原因而不是把异常抛到界面', async () => {
   const { buttons } = await loadBaseline({
     fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
     tauri: {
@@ -324,6 +885,42 @@ test('点击可用按钮但壳内失败：反馈「未成功」而不是把异�
 
   buttons['open_logs'].btn.fire('click')
   await flush()
-  // call() 已把异常降级为 null，界面只看到「未成功」
-  assert.match(buttons['open_logs'].reason.textContent, /未成功/)
+  // 新语义：callResult 把异常转成 ok:false + reason，界面展示**具体原因**，
+  // 比过去笼统的「未成功，请重试或升级客户端」更有助于排查。
+  assert.match(buttons['open_logs'].reason.textContent, /壳内业务失败/)
+  assert.match(buttons['open_logs'].reason.textContent, /失败/)
+})
+
+test('🔴 回归：命令成功但返回 unit（null）时，不得报「未成功」', async () => {
+  // 事故现场：unpair_device 的 Rust 签名是 Result<(), String>，成功时返回 null。
+  // 旧实现用 `raw === null` 判失败 → 后端日志「已解除配对」与界面「命令未成功」直接矛盾。
+  let paired = true
+  const { buttons } = await loadBaseline({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'ok' }) }),
+    tauri: {
+      core: {
+        invoke: async (cmd) => {
+          if (cmd === 'list_commands') {
+            return ['check_update', 'open_settings', 'open_logs', 'unpair_device']
+          }
+          if (cmd === 'device_status') {
+            return { paired, online: false, device_id: 'dev-1' }
+          }
+          // unpair_device 成功：返回 null（unit）。同时模拟真实副作用 —— 解绑后不再有令牌。
+          paired = false
+          return null
+        },
+      },
+    },
+  })
+
+  assert.equal(buttons['unpair_device'].btn.disabled, false, '已配对时应可点')
+  buttons['unpair_device'].btn.fire('click')
+  await flush()
+
+  const text = buttons['unpair_device'].reason.textContent
+  assert.doesNotMatch(text, /未成功/, `成功返回 null 不得报失败，实际文案：${text}`)
+  assert.match(text, /已解除配对/, '应给出解绑成功的明确反馈')
+  // 解绑成功后状态卡会刷新：按钮随之置灰，且整个绑定区块应被隐藏（未配对了）
+  assert.equal(buttons['unpair_device'].btn.disabled, true)
 })

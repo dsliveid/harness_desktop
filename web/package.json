@@ -8,7 +8,7 @@
     "dev": "node dev-server.mjs",
     "typecheck": "tsc --noEmit",
     "build": "node build-baseline.mjs",
-    "test": "node test/bundle-bridge.mjs && node --test test/tauriBridge.test.mjs test/runnerPhase.test.mjs test/baseline.test.mjs"
+    "test": "node test/bundle-bridge.mjs && node --test test/tauriBridge.test.mjs test/runnerPhase.test.mjs test/deviceBond.test.mjs test/pairingForm.test.mjs test/baseline.test.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",

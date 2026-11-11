@@ -141,6 +141,64 @@ body {
   color: var(--muted);
 }
 
+/*
+ * 配对表单的字段布局。
+ *
+ * 为什么 label 与输入框上下排而不是左右排：基线限宽 640px，左右排会把输入框
+ * 挤得很窄（服务端地址本来就长）；上下排还能容下 field-hint 那行说明。
+ */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.field input {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  /* 输入框内容可能是长地址，避免撑破卡片 */
+  min-width: 0;
+}
+
+.field input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/*
+ * 输入校验不通过时的高亮（由 main.ts 按 validatePairing 的 field 挂类）。
+ * 用红色边框而非红色文字：错误原因已写在 reason 行里，这里只需指出是哪个框。
+ */
+.field input.is-invalid {
+  border-color: var(--err);
+}
+
+.field-hint {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+/*
+ * `hidden` 属性必须强制生效。
+ * 浏览器默认样式是 `display: none`，但本文件给 .card 设了 display 相关的
+ * 布局（.actions 是 flex），flex 会覆盖 hidden 的默认 display —— 若不显式声明，
+ * 配对表单与解除配对区块会**同时显示**，正是要避免的自相矛盾状态。
+ */
+[hidden] {
+  display: none !important;
+}
+
 button {
   font: inherit;
   color: var(--text);

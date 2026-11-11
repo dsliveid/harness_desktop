@@ -13,13 +13,20 @@
 
 /** 元素桩。classList 由 className 推导，避免维护两份状态 */
 class FakeElement {
-  constructor(tag, { id = '', className = '', dataset = {} } = {}) {
+  constructor(tag, { id = '', className = '', dataset = {}, value = '' } = {}) {
     this.tagName = tag.toUpperCase()
     this.id = id
     this.className = className
     this.dataset = { ...dataset }
     this.textContent = ''
     this.disabled = false
+    /** `<input>` 的当前值（受控于测试，main.ts 会读写它） */
+    this.value = value
+    /**
+     * `hidden` 属性：main.ts 用它做区块显隐（配对表单 / 解除配对互斥）。
+     * 默认 false —— 与浏览器一致（没有 hidden 属性就是可见）。
+     */
+    this.hidden = false
     this.attributes = new Map()
     this.children = []
     this.parent = null
@@ -27,7 +34,35 @@ class FakeElement {
   }
 
   get classList() {
-    return this.className.split(/\s+/).filter(Boolean)
+    // 返回一个「既是数组、又带 add/remove/contains」的对象：
+    // main.ts 既用它做 `.includes()` 判断，也用 `.add()/.remove()` 改类名。
+    // 真实浏览器里 classList 是 DOMTokenList（不是数组），但本项目只用到这三个
+    // 方法 + 数组式遍历，用「数组挂方法」最省事且行为一致。
+    const self = this
+    const list = self.className.split(/\s+/).filter(Boolean)
+    list.add = (...names) => {
+      const set = new Set(self.className.split(/\s+/).filter(Boolean))
+      for (const n of names) set.add(n)
+      self.className = [...set].join(' ')
+    }
+    list.remove = (...names) => {
+      const set = new Set(self.className.split(/\s+/).filter(Boolean))
+      for (const n of names) set.delete(n)
+      self.className = [...set].join(' ')
+    }
+    list.contains = (name) => self.className.split(/\s+/).filter(Boolean).includes(name)
+    // main.ts 用 `classList.toggle(name, force)` 做登录输入框的校验高亮切换
+    // （有 force 参数时行为同 add/remove）。
+    list.toggle = (name, force) => {
+      const set = new Set(self.className.split(/\s+/).filter(Boolean))
+      const has = set.has(name)
+      const want = force === undefined ? !has : Boolean(force)
+      if (want) set.add(name)
+      else set.delete(name)
+      self.className = [...set].join(' ')
+      return want
+    }
+    return list
   }
 
   append(...kids) {
@@ -119,8 +154,102 @@ export function createDocument() {
     buttons[cmd] = { btn, reason }
   }
 
+  // 配对表单区块：id="pairing"，未配对时显示（与解除配对互斥）。
+  // 三个输入框 + 一个「立即配对」按钮。桩必须与真实 index.html 的 id 完全一致，
+  // 否则 main.ts 读不到 input.value 会静默走默认值（假绿）。
+  const pairing = new FakeElement('section', { id: 'pairing', className: 'card actions' })
+  const pairingTitle = new FakeElement('strong', { className: 'line-title' })
+  const pairServer = new FakeElement('input', { id: 'pair-server', value: '' })
+  const pairCode = new FakeElement('input', { id: 'pair-code', value: '' })
+  const pairName = new FakeElement('input', { id: 'pair-name', value: 'harness-desktop' })
+  pairing.append(pairingTitle)
+  for (const input of [pairServer, pairCode, pairName]) {
+    const field = new FakeElement('div', { className: 'field' })
+    field.append(input)
+    pairing.append(field)
+  }
+  {
+    const wrap = new FakeElement('div', { className: 'action' })
+    const btn = new FakeElement('button', { dataset: { cmd: 'pair_device' } })
+    const reason = new FakeElement('p', {
+      className: 'reason',
+      dataset: { reasonFor: 'pair_device' },
+    })
+    wrap.append(btn, reason)
+    pairing.append(wrap)
+    buttons['pair_device'] = { btn, reason }
+  }
+  // 初始隐藏：真实 HTML 带 hidden，由 device_status 决定是否显示
+  pairing.hidden = true
+
+  // 原生登录表单（契约一，2026-11）：已配对未登录时显示，与配对表单互斥。
+  // id="sign-in" 必须与真实 index.html 一致（assertHtmlCoverage 反查覆盖）。
+  // 🔴 放在 danger 声明**之前**没问题 —— 它不引用 danger（只有 device-binding
+  // 卡片内的桩要挂在 danger 下才受 TDZ 约束）。
+  const signInSection = new FakeElement('section', { id: 'sign-in', className: 'card actions' })
+  const signInTitle = new FakeElement('strong', { className: 'line-title' })
+  const signUsername = new FakeElement('input', { id: 'sign-username', value: '' })
+  const signPassword = new FakeElement('input', { id: 'sign-password', value: '' })
+  signInSection.append(signInTitle)
+  for (const input of [signUsername, signPassword]) {
+    const field = new FakeElement('div', { className: 'field' })
+    field.append(input)
+    signInSection.append(field)
+  }
+  {
+    const wrap = new FakeElement('div', { className: 'action' })
+    const btn = new FakeElement('button', { dataset: { cmd: 'sign_in' } })
+    const reason = new FakeElement('p', {
+      className: 'reason',
+      dataset: { reasonFor: 'sign_in' },
+    })
+    wrap.append(btn, reason)
+    signInSection.append(wrap)
+    buttons['sign_in'] = { btn, reason }
+  }
+  // 初始隐藏：与配对表单同款（device_status 决定显隐）
+  signInSection.hidden = true
+
   // 危险操作区块（解除配对）：结构同 actions，但独立成一块以匹配真实布局。
-  const danger = new FakeElement('section', { className: 'card actions danger' })
+  // id="device-binding" 必须与真实 index.html 一致 —— assertHtmlCoverage() 会反查，
+  // 桩漏建这个 id 时 main.ts 的标题渲染会静默取不到元素（假绿）。
+  const danger = new FakeElement('section', {
+    id: 'device-binding',
+    className: 'card actions danger',
+  })
+  // 卡片标题：main.ts 会按「是否已配对」动态改写（已绑定 / 未绑定 / 状态未知）
+  const dangerTitle = new FakeElement('strong', { className: 'line-title' })
+  danger.append(dangerTitle)
+
+  // 「进入主界面」按钮（2026-11）：真实 HTML 里它在 device-binding 卡片首位。
+  // 必须在 danger 声明之后建（TDZ），位置与 index.html 结构一致（反查覆盖）。
+  {
+    const wrap = new FakeElement('div', { className: 'action' })
+    const btn = new FakeElement('button', { dataset: { cmd: 'open_web_ui' } })
+    const reason = new FakeElement('p', {
+      className: 'reason',
+      dataset: { reasonFor: 'open_web_ui' },
+    })
+    wrap.append(btn, reason)
+    danger.append(wrap)
+    buttons['open_web_ui'] = { btn, reason }
+  }
+
+  // 「退出登录」行：仅已配对且已登录时显示（id 必须与真实 index.html 一致）。
+  // 独立成一行而不与解绑混排 —— 两者语义正交，混在一起用户会误点解绑。
+  const signOutRow = new FakeElement('div', { id: 'sign-out-row', className: 'action' })
+  signOutRow.hidden = true
+  {
+    const btn = new FakeElement('button', { dataset: { cmd: 'sign_out' } })
+    const reason = new FakeElement('p', {
+      className: 'reason',
+      dataset: { reasonFor: 'sign_out' },
+    })
+    signOutRow.append(btn, reason)
+    danger.append(signOutRow)
+    buttons['sign_out'] = { btn, reason }
+  }
+
   for (const cmd of ['unpair_device']) {
     const wrap = new FakeElement('div', { className: 'action' })
     const btn = new FakeElement('button', { dataset: { cmd } })
@@ -137,7 +266,7 @@ export function createDocument() {
   const foot = new FakeElement('footer', { className: 'foot' })
   foot.append(diag)
 
-  app.append(server, runner, capability, actions, danger, foot)
+  app.append(server, runner, capability, actions, pairing, signInSection, danger, foot)
 
   const doc = {
     readyState: 'loading',
