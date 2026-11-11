@@ -436,6 +436,47 @@ struct RunningChild {
     exe: PathBuf,
 }
 
+/// 判定明文 ws 地址是否指向本机回环。
+///
+/// ## 为什么需要这个判定
+///
+/// `hd-runner` 的地址安全闸门默认拒绝明文 `ws://`（令牌在查询串里裸奔的风险），
+/// 仅接受 `--dev` 豁免。但本地自托管（`http://127.0.0.1:5611`）是本项目的主部署
+/// 形态：配对档案里的 `ws_url` 就是明文回环地址。此时流量**不出本机**，不存在
+/// 局域网嗅探面，宿主应显式带上 `--dev` 拉起 Runner——而不是让 Runner 以
+/// NO_AUTH 退出、再触发守护循环的 repair 分支把整套配对清掉（2026-11-11 联调
+/// 实测踩中：GUI 配对本地服务端后数十秒内令牌与档案双双被清，设备永不在线）。
+///
+/// 判定刻意收紧：只认 `127.0.0.1` / `localhost` / `[::1]` 三个回环写法，
+/// 其余明文地址（哪怕 127.0.0.2）一律不带 `--dev`，把决定权留给 Runner 的闸门。
+fn needs_dev_flag(ws_url: &str) -> bool {
+    let Some(rest) = ws_url.strip_prefix("ws://") else {
+        return false; // wss 或非法前缀都不需要豁免
+    };
+    // `[::1]` 带方括号形式：取到 `]` 为止，避免被 `:` 切碎。
+    let host = if let Some(stripped) = rest.strip_prefix('[') {
+        match stripped.find(']') {
+            Some(end) => &stripped[..end],
+            None => return false,
+        }
+    } else {
+        rest.split(['/', '?', ':']).next().unwrap_or_default()
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// 组装 Runner 命令行参数：启动方式参数 + 按需的 `--dev`。
+///
+/// `--dev` 的语义见 [`hd_runner`] 的 `check_ws_url`：它**只放宽地址校验**，
+/// 不放宽令牌来源。这里去重：调用方已带 `--dev` 时不重复追加。
+fn runner_args(launch: &RunnerLaunch, ws_url: &str) -> Vec<String> {
+    let mut args = launch.extra_args.clone();
+    if needs_dev_flag(ws_url) && !args.iter().any(|a| a == "--dev") {
+        args.push("--dev".to_string());
+    }
+    args
+}
+
 impl Daemon {
     pub fn new(policy: ReconnectPolicy) -> Self {
         Self {
@@ -570,10 +611,11 @@ impl Daemon {
         // 见模块文档第 1 条。这里连 `.env_clear()` 都做了加码：
         // 清掉继承来的环境变量，防止某个上游变量里恰好带着旧令牌。
         //
-        // `extra_args` 只可能是 `--runner` 这类开关（由 `RunnerLaunch` 构造时写死），
-        // 不存在拼接用户输入或令牌的路径。
+        // 参数只可能是 `--runner` / `--dev` 这类开关（由 [`RunnerLaunch`] 构造
+        // 时写死 + [`runner_args`] 按 ws_url 回环判定追加），不存在拼接用户输入
+        // 或令牌的路径。
         let mut cmd = Command::new(exe);
-        cmd.args(&launch.extra_args)
+        cmd.args(runner_args(launch, ws_url))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -674,11 +716,20 @@ impl Daemon {
             exe,
         } = running;
 
-        // 先显式 drop 写端：走到这一步说明「这个子进程要结束了」。
-        // 但注意 `wait` 期间写端仍在 `stdin` 变量里保持打开，符合「正常运行不提前 EOF」。
-        drop(stdin);
-
+        // 🔴 写端必须在 `wait` 全程保持打开（2026-11-11 联调实测踩中）：
+        // Runner 以「stdin EOF」判定宿主已死并自杀（§17.2 硬语义 ②）。supervise
+        // 循环把本函数当作**常规等待入口**，若在这里 drop 写端，Runner 会在启动后
+        // 几十毫秒内读到 EOF 并以 0 优雅退出 —— 表现为「Runner 秒退、设备永不在线」，
+        // 且退出码 0 不触发重启、不触发 repair，日志里毫无异常。
+        // 旧代码在这里 `drop(stdin)`（注释与行为自相矛盾），被 supervise 的等待路径
+        // 100% 触发；集成测试全绿是因为 fake_runner 的用例不依赖「活着等 stdin」。
+        // std/tokio 的 `Child::wait` 只会关闭 **Child 自己持有**的 stdin（本 spawn 已
+        // `take()` 出来），不会碰这里的副本，因此不存在死锁风险。
+        //
+        // 正确的关闭时机只有两个：① wait 返回（子进程已死，drop 只是释放句柄）；
+        // ② 宿主整体退出（OS 关闭句柄 → Runner 读到 EOF 自杀，防孤儿语义不受影响）。
         let status = child.wait().await;
+        drop(stdin);
         let record = ExitRecord {
             code: status.as_ref().ok().and_then(|s| s.code()),
             at_ms: now_ms(),
@@ -832,6 +883,64 @@ mod tests {
 
     fn token(raw: &str) -> DeviceToken {
         DeviceToken::new(raw.to_string())
+    }
+
+    // ---------- runner_args：回环明文 ws 才带 --dev ----------
+
+    #[test]
+    fn loopback_plain_ws_gets_dev_flag() {
+        let launch = RunnerLaunch::self_derived(PathBuf::from("hd-host.exe"));
+        let args = runner_args(&launch, "ws://127.0.0.1:5611/api/v1/devices/ws");
+        assert_eq!(args, vec!["--runner", "--dev"]);
+    }
+
+    #[test]
+    fn loopback_aliases_get_dev_flag() {
+        let launch = RunnerLaunch::self_derived(PathBuf::from("hd-host.exe"));
+        for url in [
+            "ws://localhost:5611/api/v1/devices/ws",
+            "ws://[::1]:5611/api/v1/devices/ws",
+        ] {
+            assert!(
+                runner_args(&launch, url).contains(&"--dev".to_string()),
+                "回环别名 {url} 也应带 --dev"
+            );
+        }
+    }
+
+    #[test]
+    fn wss_never_gets_dev_flag() {
+        let launch = RunnerLaunch::self_derived(PathBuf::from("hd-host.exe"));
+        let args = runner_args(&launch, "wss://example.com/api/v1/devices/ws");
+        assert_eq!(args, vec!["--runner"]);
+    }
+
+    #[test]
+    fn non_loopback_plain_ws_stays_strict() {
+        // 明文非回环：不带 --dev，让 Runner 的闸门继续拒绝（把风险决定留在端侧）。
+        let launch = RunnerLaunch::self_derived(PathBuf::from("hd-host.exe"));
+        assert_eq!(
+            runner_args(&launch, "ws://192.168.1.5:5611/api/v1/devices/ws"),
+            vec!["--runner"]
+        );
+    }
+
+    #[test]
+    fn dev_flag_not_duplicated() {
+        let launch = RunnerLaunch {
+            exe: PathBuf::from("hd-runner.exe"),
+            extra_args: vec!["--dev".to_string()],
+        };
+        assert_eq!(runner_args(&launch, "ws://127.0.0.1:5611/x"), vec!["--dev"]);
+    }
+
+    #[test]
+    fn standalone_runner_also_gets_dev_flag_for_loopback() {
+        let launch = RunnerLaunch::standalone(PathBuf::from("hd-runner.exe"));
+        assert_eq!(
+            runner_args(&launch, "ws://127.0.0.1:5611/api/v1/devices/ws"),
+            vec!["--dev"]
+        );
     }
 
     // ---------- LineRing：限长语义 ----------

@@ -62,6 +62,22 @@ if ($WithWeb) {
 }
 
 # --- 1. build ---------------------------------------------------------------
+# The windows-gnu toolchain (rust-toolchain.toml pins 1.98.1-gnu) needs MinGW
+# gcc/as/dlltool for ring / windows-sys / tauri-winres(windres); the rustup
+# self-contained dir ships dlltool+ld but NOT gcc or as.
+# 2026-11-11: on this machine MSYS2 lives in C:\msys64 -- prepend mingw64/bin.
+# Probed dynamically (machine-specific path); missing probe is not fatal and
+# falls back to whatever PATH the caller already has.
+$mingwCandidates = @('C:\msys64\mingw64\bin', 'D:\msys64\mingw64\bin')
+foreach ($cand in $mingwCandidates) {
+    if ((Test-Path (Join-Path $cand 'gcc.exe')) -and
+        ($env:Path -notlike "*$cand*")) {
+        Write-Host "[env] Prepending $cand to PATH (windows-gnu needs gcc/as)"
+        $env:Path = "$cand;$env:Path"
+        break
+    }
+}
+
 $profileArgs = @()
 $profileLabel = 'debug'
 if ($Release) {

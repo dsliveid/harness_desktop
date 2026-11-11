@@ -277,7 +277,15 @@ async fn wait_exit_records_exit_code() {
     let started = wait_until(|| d_ref.logs().iter().any(|l| l.contains("auth token_len="))).await;
     assert!(started, "子进程未启动：{:?}", d.logs());
 
-    // `wait_exit` 会先关闭写端 → 假 Runner 读到 EOF → 正常退出 0。
+    // 让假 Runner 自行退出（2026-11-11 起 wait_exit 不再替子进程关写端——
+    // 旧「wait_exit 先 drop stdin → EOF 自杀」是生产缺陷，见 daemon.rs 修复注释），
+    // 这里按控制协议下发 fake_exit(0) 造出确定性的退出。
+    d.send_line(&format!(
+        r#"{{"op":"fake_exit","code":{}}}"#,
+        hd_protocol::exit_code::EXIT_OK
+    ))
+    .await
+    .expect("下发 fake_exit");
     let rec = d.wait_exit().await.expect("应有退出记录");
     assert_eq!(rec.code, Some(0), "假 Runner 正常 EOF 退出应为 0：{rec:?}");
     assert!(

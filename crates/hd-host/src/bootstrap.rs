@@ -287,16 +287,31 @@ impl Bootstrap {
         use crate::supervisor::GuardAction;
 
         loop {
-            // ① 阻塞等子进程退出。`None` 表示当前根本没有子进程（比如刚被 shutdown），
-            //    此时没有「退出事件」可判定，直接结束循环。
-            let Some(exit) = self.daemon.wait_exit().await else {
+            // ① 等子进程退出，但**与 shutdown 竞速**（2026-11-11 联调实测补上的缺口）：
+            //    修复 wait_exit 提前关 stdin 的缺陷后，子进程在正常运行期不再秒退，
+            //    wait_exit 会一直阻塞 —— 若只认「先退出再查标志」，用户点退出后
+            //    GUI 要等 Runner 自己结束（可能永远不结束）才能收尾。所以：
+            //    shutdown 先到 → 走 daemon.shutdown()（关写端 → Runner 自杀 → kill 兜底
+            //    → 释放锁），再返回 Stop。
+            //    `None` 表示当前没有子进程（比如已被 shutdown），直接结束循环。
+            let exit = tokio::select! {
+                e = self.daemon.wait_exit() => e,
+                _ = wait_shutdown_only(&shutdown) => {
+                    self.daemon.shutdown().await;
+                    // 与 wait_exit 的 None 同型：没有「退出事件」可判定。
+                    None
+                }
+            };
+
+            // ② 无退出事件（没有子进程 / shutdown 抢先收尾）：结束循环。
+            let Some(exit) = exit else {
                 return GuardAction::Stop {
                     phase: self.daemon.stats().state(),
                     repair: false,
                 };
             };
 
-            // ② 用户主动停止：立刻结束，不进入退避。
+            // ②′ 用户主动停止（子进程已自行退出的情形）：立刻结束，不进入退避。
             if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                 return GuardAction::Stop {
                     phase: self.daemon.stats().state(),
@@ -504,6 +519,26 @@ pub fn needs_pairing(vault: &dyn TokenVault) -> bool {
 /// 为什么不用 `tokio::select!` 配合通知 channel：这里的取消源只有一个原子标志，
 /// 每 100ms 轮询一次足够（最坏多等 100ms，相对 1~30s 的退避可忽略），
 /// 而不必引入 broadcast/watch 这类需要管理生命周期的原语。
+/// 无限期分段检查 shutdown 标志（供 supervise 与「等子进程退出」竞速）。
+///
+/// 用 100ms 分段轮询而非 Notify：与 [`wait_or_shutdown`] 同一口径，
+/// 且不给 Daemon 增加通知通道（stats/logs 本就是无通知读模型）。
+async fn wait_shutdown_only(shutdown: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+    loop {
+        // 先睡再查：若标志早已置位（用户在 supervise 启动前就点了退出），
+        // 立即就绪会与「子进程退出事件」同时就绪，select 随机择一 —— 随机到
+        // shutdown 分支会抢在子进程输出被搬运进日志环之前就 shutdown 收尾，
+        // 让依赖日志断言的用例产生 flaky。让一步 100ms（远小于人感知阈值）
+        // 把优先级还给「正常退出事件」，shutdown 最坏也只晚 100ms 生效。
+        tokio::time::sleep(SLICE).await;
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+}
+
 async fn wait_or_shutdown(
     total: std::time::Duration,
     shutdown: &std::sync::atomic::AtomicBool,
@@ -530,8 +565,12 @@ mod tests {
     use hd_runner::reconnect::ReconnectPolicy;
 
     fn bootstrap_with(vault: Arc<dyn TokenVault>) -> Bootstrap {
-        let daemon = Arc::new(Daemon::new(ReconnectPolicy::default()));
-        Bootstrap::new(vault, daemon, "hd-runner-does-not-exist-xyz", 1)
+        // 🔴 必须注入独立锁路径：默认锁指向用户数据目录，若本机恰好有真实
+        // GUI 在跑，这里会抢锁失败误报 ExternallyRunning（2026-11-11 实测踩中）。
+        let daemon = Daemon::new(ReconnectPolicy::default()).with_lock_path(
+            std::env::temp_dir().join(format!("hd-bootstrap-test-{}.lock", std::process::id())),
+        );
+        Bootstrap::new(vault, Arc::new(daemon), "hd-runner-does-not-exist-xyz", 1)
     }
 
     #[tokio::test]

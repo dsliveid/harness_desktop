@@ -116,6 +116,21 @@ cd web && npm ci && npm run build && cd ..
 .\scripts\build-exe.ps1
 ```
 
+或走根目录一键脚本（等价封装，额外提供 `--with-web` / `--out`）：
+
+```bash
+./build.sh                 # = .\scripts\build-exe.ps1
+./build.sh --with-web      # 先重建前端并同步，再打包
+./run.sh                   # = .\scripts\dev.ps1（build + launch）
+./run.sh --no-launch       # 只构建不启动（IDE 调试用）
+```
+
+Windows 用户可直接 `build.cmd` / `run.cmd`（自动找 bash，无需先开 Git Bash）。
+
+> 两个 `.sh` 是 `scripts/*.ps1` 的**薄封装**，不重写构建逻辑：
+> `--features gui` 为何必需、为何不用 `cargo run`、20MB 预算与 stray `hd-runner.exe`
+> 告警全部留在 ps1 里，避免两份会漂移的真相。脚本只服务 **Windows**。
+
 产物：
 
 ```
@@ -235,6 +250,32 @@ cd web && npm ci && npm run build && cd ..
 
 > 注：单包分发下不再存在「漏拷第二个文件」这种情况，故 `runner_missing`
 > 的文案已改为指向程序自身异常，避免把用户引去找一个不存在的 `hd-runner.exe`。
+
+### 本地（ws://127.0.0.1）服务端的配对
+
+自托管服务端默认监听 `http://127.0.0.1:5611`，配对后档案里的 `ws_url` 是明文
+`ws://`。Runner 的地址安全闸门默认拒绝明文 ws（防 `?token=` 在局域网裸奔），
+宿主因此按**回环判定**自动补 `--dev`：仅当 ws_url 指向 `127.0.0.1` / `localhost`
+/ `[::1]`（流量不出本机、无嗅探面）才豁免，其余明文地址维持拒绝（见
+`daemon.rs` 的 `needs_dev_flag`）。2026-11-11 之前该场景会在配对后数十秒内
+触发守护循环 repair 把令牌清空（Runner NO_AUTH 退出 → repair），表现为
+「配对成功但设备永不在线」——已修复并留回归单测。
+
+### 守护循环的等待语义（2026-11-11 修复）
+
+`Daemon::wait_exit` 曾在 `child.wait()` 前 `drop(stdin)`，而 Runner 以
+「stdin EOF = 宿主已死」自杀，导致 supervise 循环启动即把 Runner 杀死
+（31ms 内退出码 0，设备永不在线且无任何日志）。现语义为：**等待期间写端
+保持打开**，`supervise` 用 `select` 让「子进程退出」与「shutdown 标志」竞速，
+退出时先走优雅收尾（关写端 → 自杀 → 1s kill 兜底）。回归用例：
+`daemon_e2e::wait_exit_records_exit_code`、`supervise_e2e::*`。
+
+### GUI 日志
+
+GUI 进程日志走 **stderr**（console 子系统随宿主控制台输出；被管道拉起时
+由父进程 ring 收集），级别可用 `RUST_LOG` 覆盖，默认 `info`。守护循环结束时
+以 warn 记录 `last_exit`（退出码是判断 Runner 死因的唯一线索：0=优雅退出、
+2/4=需重配对、3=重试耗尽、6=协议不匹配）。
 
 配对流程（`pair_device` command，**异步**）：
 

@@ -228,7 +228,8 @@ pub fn run() -> tauri::Result<()> {
                         std::sync::Arc::clone(&shutdown),
                     );
                     let stop = boot.supervise(&mut guard, shutdown).await;
-                    tracing::info!(?stop, "守护循环结束");
+                    let last_exit = state.daemon().last_exit();
+                    tracing::warn!(?stop, ?last_exit, "守护循环结束");
                 }
             });
 

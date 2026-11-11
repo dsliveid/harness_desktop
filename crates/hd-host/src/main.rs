@@ -96,10 +96,18 @@ where
 ///
 /// 不引入 `tracing-subscriber` 到 lib 依赖里：只有 bin 需要它，
 /// 放在这里能让库使用方自由选择日志后端。
-fn tracing_subscriber_init() -> Result<(), Box<dyn std::error::Error>> {
-    // 说明：当前 crate 未直接依赖 tracing-subscriber（避免给 GUI 之外的场景加依赖），
-    // 因此这里只做占位。接入时按下面两行替换：
-    //   tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+fn tracing_subscriber_init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // GUI 进程的日志走 stderr（console 子系统下随宿主控制台输出；经管道拉起时
+    // 由父进程的 ring 收集）。RUST_LOG 可覆盖级别，缺省 info。
+    // 2026-11-11 联调教训：这里长期是占位实现，GUI 内 spawn 失败时**零线索**
+    // （无日志、无弹窗、子进程静默消失），排查只能靠猜。排障信息是产品能力。
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init()?;
     tracing::info!("hd-host 启动（版本 {}）", env!("CARGO_PKG_VERSION"));
     Ok(())
 }
