@@ -521,34 +521,43 @@ pub async fn sign_in(
 ///
 /// 双通道之一（另一条是托盘菜单，不依赖 IPC）。目标地址用**启动时快照**的
 /// 基线页 URL（dev 是 localhost:1420、prod 是壳内 asset 协议地址，二者写死
-/// 必错其一）；快照缺失（极端时序）降级为前置聚焦——窗口大概率还在基线页。
+/// 必错其一）。
+///
+/// 🔴 **失败必须返回 Err，绝不「假成功」**（2026-11 修正）。
+///
+/// 早期实现里「无快照」「navigate 失败」两条路径都是 `return Ok(())` —— 只写一条
+/// `tracing::warn`。IPC 调用方（服务端 Web UI 的宿主设置浮标）拿到 Ok 后认为
+/// 跳转成功，页面却纹丝不动；叠加前端 `if (!promise)` 的真值误判，最终表现为
+/// 「浮标点了毫无反应，且永远不隐藏」的死钮，且日志只在壳侧可见，极难排查。
+///
+/// 现在的语义：**只有真的发起导航才 Ok**；其余一律 Err(可读原因)，
+/// 让前端能据 `ok === false` 隐藏浮标并 console 带出原因。
 #[tauri::command]
 pub fn open_baseline(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.set_focus();
-        let url = baseline_url_snapshot(&app);
-        match url {
-            Some(u) => {
-                match url::Url::parse(&u) {
-                    Ok(parsed) => {
-                        if let Err(e) = w.navigate(parsed) {
-                            tracing::warn!(error = %e, "返回基线页失败（保留当前页面）");
-                        } else {
-                            tracing::info!("已返回基线页（设置界面）");
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "基线页地址非法，无法导航返回"),
-                }
-                return Ok(());
-            }
-            None => {
-                // 无快照：窗口多半还停在基线页（比如从未导航过），聚焦即可。
-                tracing::info!("无基线页快照，仅前置主窗口（大概率已在基线页）");
-                return Ok(());
-            }
-        }
-    }
-    Err("主窗口不存在".to_string())
+    let Some(w) = app.get_webview_window("main") else {
+        return Err("主窗口不存在".to_string());
+    };
+    let _ = w.set_focus();
+
+    let Some(u) = baseline_url_snapshot(&app) else {
+        // 无快照（极端时序：setup 尚未写入）。此前「仅聚焦后报成功」是错的：
+        // 若窗口其实已停在服务端 Web UI，聚焦等于什么都没发生。
+        tracing::warn!("无基线页快照，无法返回设置界面");
+        return Err("无基线页快照（应用可能刚启动，请稍后重试或从托盘菜单返回）".to_string());
+    };
+
+    let parsed = url::Url::parse(&u).map_err(|e| {
+        tracing::warn!(error = %e, "基线页地址非法，无法导航返回");
+        format!("基线页地址非法：{e}")
+    })?;
+
+    w.navigate(parsed).map_err(|e| {
+        tracing::warn!(error = %e, "返回基线页失败（保留当前页面）");
+        format!("导航到基线页失败：{e}")
+    })?;
+
+    tracing::info!("已返回基线页（设置界面）");
+    Ok(())
 }
 
 /// 基线页 URL 快照的存取（启动 setup 时写入一次，之后只读）。
