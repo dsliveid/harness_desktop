@@ -165,9 +165,38 @@ hd-host.exe --runner  → 风险执行进程（无窗口，跑命令/动文件�
 .\scripts\dev.ps1              # 构建 + 启动
 .\scripts\dev.ps1 -NoLaunch    # 只构建（IDE 调试前）
 .\scripts\dev.ps1 -WithWeb     # 连前端一起重建
+.\scripts\dev.ps1 -EmbeddedWeb # 前端内嵌进 exe，不依赖 1420 端口
 ```
 
-单包后不再存在「改了 runner 却跑旧 exe」的静默错配问题。详见设计文档 §2.5。
+#### 🔴 为什么 dev 构建必须有一个服务在 1420 上应答
+
+现象：双击/脚本启动后，窗口里显示 **`localhost 拒绝连接`**（`ERR_CONNECTION_REFUSED`）。
+
+因果链（每一环都可在源码里核对）：
+
+| 环节 | 事实 |
+| --- | --- |
+| `tauri/build.rs` | `dev = !custom_protocol` → 不开 `custom-protocol` 就是 **dev 构建** |
+| `tauri/src/manager/mod.rs::get_app_url` | `#[cfg(dev)]` 分支**只取** `build.devUrl`，**不加载**内嵌资源 |
+| `crates/hd-host/tauri.conf.json` | `devUrl = http://localhost:1420` |
+| `crates/hd-host/tauri.conf.json` | `beforeDevCommand` **只有 `tauri dev` CLI 才执行** |
+| `scripts/dev.ps1` | 刻意直接跑 exe（`cargo run` 无法表达「只构建不启动」）→ **没人起 dev server** |
+
+四条凑在一起，窗口必然去敲一个没人监听的端口。所以脚本现在把「保证 1420 有服务」
+作为第 `[1/4]` 步：端口已在监听就复用；没监听就 `npm install`（缺 esbuild 时）+
+后台拉起 `node dev-server.mjs` + **轮询等端口就绪（最多 25s）**，超时抛错并打印日志尾部
+（绝不静默继续去开一个注定白屏的窗口）。
+
+日志在 `target/dev-server.log`；dev server 的 PID 会打印出来，收工用
+`Stop-Process -Id <PID>` 精确结束（脚本绝不按进程名杀）。
+
+#### `--embedded-web`：不想开 dev server 就用它
+
+`-EmbeddedWeb` 会带 `custom-protocol` 编译，Tauri 因此视作 **production**：忽略
+`devUrl`、加载内嵌的 `crates/hd-host/ui/`。代价是前端改动需要重新 `npm run build` +
+`sync-web.ps1`（即 `-WithWeb`），换来的是「单 exe 自包含运行」。
+
+单包后不再存在「改了 runner 却跑旧 exe」的静默错配问题。详见设计文档 §2.5 / §21.2。
 
 ---
 

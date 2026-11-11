@@ -18,15 +18,25 @@
 #   --release         release 构建（更慢，产物更小）
 #   --no-launch       只构建，不启动（想在 IDE 里调试时用）
 #   --with-web        先把 web UI 重新构建并同步到 crates/hd-host/ui
+#   --embedded-web    用 custom-protocol 构建（前端资源内嵌进 exe，不依赖 1420 端口）
 #   --out DIR         构建完成后把 target/<profile>/hd-host.exe 复制到 DIR
 #   --dry-run         只打印将要执行的 powershell 命令，不真正执行
 #   -h, --help        显示本帮助
+#
+# 🔴 为什么默认启动需要 1420 端口
+#   默认构建只开 `gui`、不开 `custom-protocol`，Tauri 因此判定为 dev 态
+#   （`tauri/build.rs`: dev = !custom_protocol），窗口只会去加载
+#   tauri.conf.json 的 `build.devUrl`（http://localhost:1420），**不会**加载内嵌资源。
+#   而 `beforeDevCommand` 只有 `tauri dev` CLI 才会执行，本脚本刻意直接跑 exe，
+#   所以历史表现就是「窗口打开后显示 localhost 拒绝连接」。
+#   现在 dev.ps1 会在构建前自动拉起/复用 dev server 并等端口就绪；
+#   不想开 dev server 就用 --embedded-web（前端内嵌，自包含运行）。
 #
 # 其余参数放在 `--` 之后会原样透传给 hd-host.exe（启动时才有意义）：
 #   ./run.sh --release -- --log-level debug
 #
 # 等价的手敲命令（脚本内部就是转发它们）：
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 [-Release] [-NoLaunch] [-WithWeb]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 [-Release] [-NoLaunch] [-WithWeb] [-EmbeddedWeb]
 #
 # 注意：GUI 进程启动后脚本立即返回，控制台留给你看日志。
 #       hd-host 会自己再 spawn 一个 `--runner` 子进程，这是设计如此。
@@ -70,6 +80,7 @@ done
 RELEASE=""
 NO_LAUNCH=""
 WITH_WEB=""
+EMBEDDED_WEB=""
 OUT_DIR=""
 DRY_RUN=""
 PASSTHRU=()
@@ -79,6 +90,7 @@ while [ $# -gt 0 ]; do
     --release)   RELEASE=1 ;;
     --no-launch) NO_LAUNCH=1 ;;
     --with-web)  WITH_WEB=1 ;;
+    --embedded-web) EMBEDDED_WEB=1 ;;
     --debug)     RELEASE="" ;;
     --out)       [ $# -ge 2 ] || die "--out 需要一个目录参数。"; OUT_DIR="$2"; shift ;;
     --out=*)     OUT_DIR="${1#*=}" ;;
@@ -103,6 +115,7 @@ PS_ARGS=(-NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1)
 [ -n "$RELEASE" ]   && PS_ARGS+=(-Release)
 [ -n "$NO_LAUNCH" ] && PS_ARGS+=(-NoLaunch)
 [ -n "$WITH_WEB" ]  && PS_ARGS+=(-WithWeb)
+[ -n "$EMBEDDED_WEB" ] && PS_ARGS+=(-EmbeddedWeb)
 
 PROFILE="debug"
 [ -n "$RELEASE" ] && PROFILE="release"
@@ -138,4 +151,7 @@ if [ -n "$NO_LAUNCH" ]; then
   say '完成（只构建，未启动）。'
 else
   say '完成。GUI 进程已在后台运行（脚本不会等它退出）。'
+  if [ -z "$EMBEDDED_WEB" ]; then
+    say "提示：dev 构建的窗口加载 http://localhost:1420，dev.ps1 已确保该端口有服务在应答。"
+  fi
 fi
