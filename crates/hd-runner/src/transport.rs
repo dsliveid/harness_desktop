@@ -94,6 +94,13 @@ pub struct Session {
 pub struct Connection {
     /// 握手结果。
     pub session: Session,
+    /// 能力清单摘要（与 `hello` 帧同源，用于心跳帧向服务端复述）。
+    ///
+    /// 为什么放在连接上而不是每次 ping 现算：ping 只拿到 `&mut Connection`，
+    /// 拿不到 Router；而 hello 与 ping 的 hash 一旦各算各的，就可能出现
+    /// 「首帧申报 A、心跳说 B」的自相矛盾，服务端会反复触发重拉。
+    /// 因此这里唯一来源是 `hello.capabilities_hash`（见 [`Self::connect`]）。
+    capabilities_hash: String,
     inner: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
@@ -133,7 +140,12 @@ impl Connection {
 
         // 可选的首帧自述。服务端允许先收 hello 再回 welcome（gateway.go:306），
         // 但**不依赖**它 —— 真实网关在连上时就已主动推了 welcome（gateway.go:205）。
+        //
+        // 🔴 这里把 hello 里的 `capabilities_hash` 留存下来：心跳帧要复述同一个摘要，
+        // 否则「首帧申报 A、心跳说空」会让服务端误判能力变更。
+        let mut capabilities_hash = String::new();
         if let Some(h) = hello {
+            capabilities_hash = h.capabilities_hash.clone();
             let env = Envelope::new(
                 MessageType::Hello,
                 new_frame_id(),
@@ -152,7 +164,18 @@ impl Connection {
             None => return Err(TransportError::Ws("连接在握手前被关闭".into())),
         };
 
-        Ok(Self { session, inner: ws })
+        Ok(Self {
+            session,
+            capabilities_hash,
+            inner: ws,
+        })
+    }
+
+    /// 本连接上报的能力摘要（与 `hello` 首帧一致，心跳帧复述同一值）。
+    ///
+    /// 公开只读：便于 e2e 断言「hello 的 hash 确实被留存并随心跳复述」。
+    pub fn capabilities_hash(&self) -> &str {
+        &self.capabilities_hash
     }
 
     /// 发送一次心跳并等待 `pong`。
@@ -165,7 +188,8 @@ impl Connection {
             Some(
                 serde_json::to_value(PingPayload {
                     load: None,
-                    capabilities_hash: String::new(),
+                    // 与 hello 首帧同源（见 `Self::connect`）：服务端据此判断能力是否变更。
+                    capabilities_hash: self.capabilities_hash.clone(),
                     protocol_version: hd_protocol::CURRENT_PROTOCOL_VERSION,
                 })
                 .map_err(|e| TransportError::Payload(e.to_string()))?,

@@ -111,6 +111,78 @@ async fn hello_is_sent_when_provided() {
     srv.shutdown();
 }
 
+/// 🔴 回归：能力摘要必须由 hello 留存、并随每一次 ping 复述同一个值。
+///
+/// 历史缺陷：`ping_once` 里 `capabilities_hash` 恒为 `String::new()`，服务端
+/// 收到空摘要 → 无法判断该设备能力是否变更，目录列举能力申报形同虚设。
+#[tokio::test]
+async fn ping_echoes_the_capabilities_hash_from_hello() {
+    let srv = FakeServer::start(fast_config())
+        .await
+        .expect("假服务端应能启动");
+
+    // 用真实派生逻辑算摘要：证明「hello 与 ping 同源」不是靠手写字符串对上的
+    let policy = std::sync::Arc::new(hd_core::Policy::new(vec![], vec![]));
+    let mut router = hd_runner::Router::new(
+        std::sync::Arc::clone(&policy),
+        std::sync::Arc::new(hd_core::NullAuditSink),
+        std::sync::Arc::new(hd_runner::IdempotStore::with_defaults()),
+    );
+    router.register(hd_core::ListDirsExecutor::new(
+        std::sync::Arc::clone(&policy),
+        None,
+        500,
+    ));
+    let (caps, caps_hash) = hd_runner::capabilities_snapshot(&router);
+    assert_eq!(caps.len(), 1, "应申报 fs.list");
+    assert_eq!(caps[0].name, "fs.list");
+
+    let hello = HelloPayload {
+        name: "测试 Runner".into(),
+        platform: "windows-amd64".into(),
+        app_version: "0.1.0".into(),
+        capabilities_hash: caps_hash.clone(),
+        protocol_version: hd_protocol::CURRENT_PROTOCOL_VERSION,
+        capabilities: caps,
+    };
+
+    let mut conn = Connection::connect(&srv.url, "hgd_test_token", Some(hello))
+        .await
+        .expect("握手应成功");
+    assert_eq!(conn.capabilities_hash(), caps_hash.as_str());
+
+    conn.ping_once().await.expect("心跳应成功");
+
+    let seen = srv
+        .last_ping_capabilities_hash()
+        .expect("假服务端应已解出 ping 负载");
+    assert_eq!(
+        seen, caps_hash,
+        "ping 必须复述 hello 的能力摘要，不得为空串"
+    );
+    assert!(
+        seen.starts_with("fnv1a64:"),
+        "摘要应带算法前缀，实际 {seen}"
+    );
+
+    srv.shutdown();
+}
+
+/// 未提供 hello 时不臆造能力（保持与改造前一致的「不申报」语义）。
+#[tokio::test]
+async fn ping_without_hello_reports_empty_capabilities_hash() {
+    let srv = FakeServer::start(fast_config())
+        .await
+        .expect("假服务端应能启动");
+    let mut conn = Connection::connect(&srv.url, "hgd_test_token", None)
+        .await
+        .expect("握手应成功");
+    assert!(conn.capabilities_hash().is_empty());
+    conn.ping_once().await.expect("心跳应成功");
+    assert_eq!(srv.last_ping_capabilities_hash().as_deref(), Some(""));
+    srv.shutdown();
+}
+
 #[tokio::test]
 async fn wrong_token_is_rejected_before_upgrade() {
     let srv = FakeServer::start(fast_config())

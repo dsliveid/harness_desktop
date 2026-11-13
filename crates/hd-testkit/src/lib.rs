@@ -60,6 +60,8 @@ pub struct FakeServer {
     pub pings: Arc<AtomicUsize>,
     /// 收到的 `hello` 次数。
     pub hellos: Arc<AtomicUsize>,
+    /// 最近一次 `ping` 帧里携带的 `capabilities_hash`（供断言心跳复述能力摘要）。
+    pub last_ping_caps_hash: Arc<std::sync::Mutex<Option<String>>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -71,11 +73,14 @@ impl FakeServer {
 
         let pings = Arc::new(AtomicUsize::new(0));
         let hellos = Arc::new(AtomicUsize::new(0));
+        let last_ping_caps_hash: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let expected_token = cfg.token.clone();
         let url = format!("ws://{addr}/api/v1/devices/ws");
 
         let pings_task = Arc::clone(&pings);
         let hellos_task = Arc::clone(&hellos);
+        let caps_task = Arc::clone(&last_ping_caps_hash);
 
         let handle = tokio::spawn(async move {
             // 只服务一个连接即可满足 P2 验收（重连测试会重复 start）。
@@ -131,7 +136,11 @@ impl FakeServer {
                     match env.msg_type {
                         MessageType::Ping => {
                             pings_task.fetch_add(1, Ordering::SeqCst);
-                            let _ = env.decode::<PingPayload>();
+                            if let Ok(Some(p)) = env.decode::<PingPayload>() {
+                                if let Ok(mut guard) = caps_task.lock() {
+                                    *guard = Some(p.capabilities_hash);
+                                }
+                            }
                             let pong = PongPayload {
                                 server_time: now_ms(),
                                 pending: 0,
@@ -161,6 +170,7 @@ impl FakeServer {
             url,
             pings,
             hellos,
+            last_ping_caps_hash,
             handle,
         })
     }
@@ -173,6 +183,11 @@ impl FakeServer {
     /// 已收到的 hello 数。
     pub fn hello_count(&self) -> usize {
         self.hellos.load(Ordering::SeqCst)
+    }
+
+    /// 最近一次 ping 携带的 `capabilities_hash`（尚未收到 ping 时为 `None`）。
+    pub fn last_ping_capabilities_hash(&self) -> Option<String> {
+        self.last_ping_caps_hash.lock().ok().and_then(|g| g.clone())
     }
 
     /// 显式停止（测试结束调用，避免任务泄漏到下一个测试）。

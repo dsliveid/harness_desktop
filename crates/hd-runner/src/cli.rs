@@ -41,6 +41,9 @@
 
 use std::io::BufReader;
 
+use hd_protocol::payload::HelloPayload;
+
+use crate::capabilities;
 use crate::idempot::IdempotStore;
 use crate::ipc::{redact_token, IpcCommand, IpcReader};
 use crate::reconnect::ReconnectPolicy;
@@ -213,11 +216,33 @@ async fn run_async(dev_mode: bool) -> u8 {
 
     // 初始白名单根：进程当前目录（保证开箱可用），后续由宿主经 `reload_policy` 精确下发。
     let initial_roots = initial_roots();
+    let router = std::sync::Arc::new(build_router(initial_roots));
+
+    // 🔴 能力申报必须与 Router 同源：hello 的 capabilities / capabilities_hash 全部由
+    //    `capabilities::snapshot(&router)` 派生，禁止手写能力清单。
+    //    此前这里根本没有 hello（`WsConnector::new` 不带首帧），服务端因此永远收不到
+    //    能力清单，判断不了该设备是否具备 `fs.list`（目录列举）能力。
+    let (caps, caps_hash) = capabilities::snapshot(&router);
+    tracing::info!(
+        capabilities = caps.len(),
+        names = ?caps.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        capabilities_hash = %caps_hash,
+        "申报设备能力（hello 首帧）"
+    );
+    let hello = HelloPayload {
+        name: std::env::var("HD_DEVICE_NAME").unwrap_or_else(|_| default_device_name()),
+        platform: platform_tag(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities_hash: caps_hash,
+        protocol_version: auth.protocol_version,
+        capabilities: caps,
+    };
+
     let mut sup = Supervisor::new(
-        WsConnector::new(auth.ws_url.clone(), auth.token.clone()),
+        WsConnector::new(auth.ws_url.clone(), auth.token.clone()).with_hello(hello),
         ReconnectPolicy::default(),
     )
-    .with_router(std::sync::Arc::new(build_router(initial_roots)));
+    .with_router(std::sync::Arc::clone(&router));
     // 令牌用完即弃：`WsConnector` 内部需要它建连接，故这里无法清零；
     // 但 `auth` 这个局部变量后续不再被引用，作用域结束即释放。
     let mut observer = NoopObserver;
@@ -272,6 +297,24 @@ async fn run_async(dev_mode: bool) -> u8 {
 /// 宿主的 `reload_policy` 会很快把它替换成精确白名单。
 fn initial_roots() -> Vec<std::path::PathBuf> {
     std::env::current_dir().map(|p| vec![p]).unwrap_or_default()
+}
+
+/// 缺省设备名：`<主机名>-desktop`，取不到主机名就退化成固定字面量。
+///
+/// 只用于「服务端设备列表里给人看」，不参与鉴权。宿主可用 `HD_DEVICE_NAME`
+/// 环境变量覆盖（方便多设备联调时区分）。
+fn default_device_name() -> String {
+    match std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
+        Ok(host) if !host.trim().is_empty() => format!("{}-desktop", host.trim()),
+        _ => "harness-desktop".to_string(),
+    }
+}
+
+/// 平台标识（服务端用于展示与排障，不参与鉴权；与 hd-host 的 `platform_tag` 同口径）。
+fn platform_tag() -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    format!("{os}-{arch}")
 }
 
 /// 校验 WS 地址：生产必须 `wss://`，只有 `--dev` 才豁免。
