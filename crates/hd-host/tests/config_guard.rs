@@ -220,6 +220,100 @@ fn remote_capability_is_minimal() {
     );
 }
 
+/// 🔴 真·守卫：`remote.urls` 的**通配符语义**必须能匹配真实部署地址。
+///
+/// ## 为什么上一条测试不够（这是一次真实回归）
+///
+/// 上一版这里写的是 `"http://*"` / `"https://*"`。上一条测试只验证「字段存在且
+/// 非空」，于是它**通过**了 —— 而线上浮标依然点了没反应、并且点完就消失。
+///
+/// 根因在 URL Pattern 标准的端口语义（`urlpattern::constructor_parser`）：
+/// 模式里 hostname 存在但**未写 port** 时，port 被补成**空字符串**，而空模式
+/// 只匹配空端口。服务端 Web UI 的实际地址是 `http://127.0.0.1:5611`（端口非空），
+/// 于是 `http://*` 对它**永不命中** →
+/// ACL 判定 remote origin 无权限 → `invoke('open_baseline')` 被拒 →
+/// `openHostSettings()` 返回 `ok:false` → 浮标按设计自我隐藏。
+///
+/// 实测（urlpattern 0.6.0）：`http://*` 对 6 种真实部署地址命中 **0/6**；
+/// 改成 `http://*:*` / `https://*:*` 后命中 6/6。
+///
+/// ## 为什么用「实际匹配」而不是「字符串比对」
+///
+/// 该缺陷的本质是**语义**而非字面量：`http://*` 看起来天经地义，JSON 也完全合法。
+/// 只有把「模式 × 真实地址」喂进同一个 URL Pattern 实现跑一遍，才能真正拦住它。
+/// 所以本测试直接依赖 `urlpattern`（tauri 自身 ACL 所用的同一 crate 与同一版本语义），
+/// 而不是自己写正则近似 —— 近似必然与真实实现漂移。
+#[test]
+fn remote_capability_urls_actually_match_real_server_addresses() {
+    let raw = read_to_string("capabilities/main-remote.json");
+    let cap: serde_json::Value = serde_json::from_str(&raw).expect("main-remote.json 必须是合法 JSON");
+    let urls: Vec<String> = cap
+        .get("remote")
+        .and_then(|v| v.get("urls"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(!urls.is_empty(), "remote.urls 不能为空");
+
+    // 真实部署形态（用户实际会遇到的全部地址形状）：
+    // - 本机默认端口（最常用）
+    // - 局域网 IP + 5611（跨机部署）
+    // - 公网域名 https（隐式 443，端口会被 URL 规范化掉）
+    // - 公网 https + 显式端口（反代）
+    // - 带 hash 路由 / 带 path 的页面（浮标在 /login 与主界面都可能出现）
+    let real_addresses = [
+        "http://127.0.0.1:5611/",
+        "http://192.168.1.5:5611/",
+        "https://harness.example.com/",
+        "https://harness.example.com:8443/",
+        "http://localhost:5611/#/chat",
+        "http://127.0.0.1:5611/login",
+    ];
+
+    let patterns: Vec<urlpattern::UrlPattern<regex::Regex>> = urls
+        .iter()
+        .map(|u| {
+            let init = urlpattern::UrlPatternInit {
+                base_url: u.parse().ok(),
+                ..Default::default()
+            };
+            urlpattern::UrlPattern::<regex::Regex>::parse(
+                init,
+                urlpattern::UrlPatternOptions {
+                    regex_syntax: urlpattern::RegexSyntax::default(),
+                    ignore_case: false,
+                },
+            )
+            .unwrap_or_else(|e| panic!("remote.urls 里的模式 `{u}` 无法解析：{e}"))
+        })
+        .collect();
+
+    for addr in real_addresses {
+        let parsed = url::Url::parse(addr).expect("测试地址必须合法");
+        let hit = patterns.iter().any(|p| {
+            p.test(urlpattern::UrlPatternMatchInput::Url(parsed.clone()))
+                .unwrap_or(false)
+        });
+        assert!(
+            hit,
+            "🔴 没有任何一条 remote.urls 能匹配真实地址 `{addr}`。\n\
+             当前模式：{urls:?}\n\
+             \n\
+             这是「浮动设置按钮点了没反应且点完就消失」的直接原因：\n\
+             远程页面匹配不到 capability → ACL 拒绝 open_baseline →\n\
+             浮标按设计自我隐藏（绝不留死钮）。\n\
+             \n\
+             最常见的错误写法是 `http://*` —— URL Pattern 标准里「未写 port」等于\n\
+             「port 必须是空」，因此它永远匹配不上带非默认端口的地址。\n\
+             正确写法：`http://*:*` 与 `https://*:*`（显式通配端口）。"
+        );
+    }
+}
+
 /// 内置基线产物：**存在则校验不滞后，不存在则跳过**。
 ///
 /// ## 为什么必须是「条件断言」而不是硬断言

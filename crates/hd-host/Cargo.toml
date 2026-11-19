@@ -78,6 +78,16 @@ keyring = { version = "3", features = ["apple-native"] }
 # test-util 提供 start_paused（虚拟时钟），让退避重试的单测不用真等 30 秒。
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# 🔴 仅测试用：验证 capabilities 的 `remote.urls` 通配符**语义**是否真能匹配
+# 真实部署地址（见 tests/config_guard.rs::remote_capability_urls_actually_match_...）。
+#
+# 为什么必须用真实实现而不是自己写正则：Tauri 的 ACL 判定就是
+# `url_pattern.test(url)`（tauri/src/ipc/authority.rs），底层正是 urlpattern crate。
+# 曾因 `http://*` 的「未写 port = 空端口」语义写出一个永不命中的模式，
+# 而当时只校验「字段存在」的守卫完全放行 —— 线上表现为浮标点击即消失。
+# 自写近似正则必然与该实现漂移，故直接依赖同源 crate。
+urlpattern = "0.6"
+regex = "1"
 
 # GUI 入口需要 feature gui，默认不编译（原因见 src/lib.rs 顶部）。
 [[bin]]

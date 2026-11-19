@@ -4,7 +4,7 @@
   "description": "远程服务端 Web UI（WebView 内的 http(s) 页面）的最小 IPC 面：**只**允许「返回本地设置页」一个低危导航命令。远程内容是服务端下发、可被热更替换的，因此绝不给它配对/解绑/登录/改服务端地址这类有真实副作用的能力 —— 否则一个被篡改或被中间人注入的远程包就能解绑设备、把客户端指向攻击者的服务器。",
   "windows": ["main"],
   "remote": {
-    "urls": ["http://*", "https://*"]
+    "urls": ["http://*:*", "https://*:*"]
   },
   "local": false,
   "permissions": [

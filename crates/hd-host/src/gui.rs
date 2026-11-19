@@ -486,9 +486,40 @@ fn prepare_web_ui_entry(state: &HostState, target: &str) -> String {
     target.to_string()
 }
 
-/// 当前设备 ID（ticket 请求体需要；握手前为空串 —— 服务端按展示用处理）。
+/// 当前设备 ID（ticket 请求体需要）。
+///
+/// ## 🔴 为什么不能只读 WS 握手（2026-11 修复，勿回退）
+///
+/// 服务端兑换 ticket 时要按**这台设备是什么形态**决定签 `web_session` 还是降级成
+/// `webview`（`sessionKindForDevice`），依据是 ticket 里的 device_id 查 devices 表。
+/// 若这里返回空串，服务端查不到设备 → 保守降级成 webview → 桌面端在 Web UI 里
+/// 被当成移动端：**建项目 403、审批被拒、建会话时 project_id 被清空**。
+///
+/// 而 `state.handshake_device_id()` 只在 WS `welcome` 握手后才有值，且本仓库
+/// **没有任何生产代码调用 `set_handshake`**（仅单测直接写字段）—
+/// 只读它的结果就是「恒为空串」，等于把上面的降级缺陷永久固化。
+///
+/// 因此改为两级取值：
+///   ① 优先 WS 握手结果（最实时，能反映服务端重配后的新 id）；
+///   ② 握手未就绪时回退**配对档案** `profile.json` 的 `device_id`。
+///      配对成功时由 `Bootstrap::on_paired` 写入，是持久事实，冷启动即可用。
+///
+/// 两者都拿不到才返回空串（此时服务端保守降级，是安全的默认）。
 fn device_id_of(state: &HostState) -> String {
-    state.handshake_device_id().unwrap_or_default()
+    if let Some(id) = state.handshake_device_id() {
+        if !id.trim().is_empty() {
+            return id;
+        }
+    }
+    // 档案读取失败按「无 device_id」处理（不阻断签票）：ticket 仍能签，
+    // 只是会话降级 —— 比让用户完全进不去 Web UI 更好。
+    use crate::profile::ProfileStore;
+    crate::profile::FileProfileStore::with_default_path()
+        .load()
+        .ok()
+        .flatten()
+        .map(|p| p.device_id)
+        .unwrap_or_default()
 }
 
 /// 原生登录（契约一：登录只在原生）。
