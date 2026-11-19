@@ -76,6 +76,13 @@ interface DeviceStatusBody {
    * 后端只在「确实没有可用会话」时才回值；可选字段，缺省即无失效事实。
    */
   session_invalid?: unknown
+  /**
+   * 当前生效的服务端基址（如 `http://192.168.1.5:5611`）。
+   *
+   * **非凭据**，可安全回显。改造前界面上完全看不到「我在连哪台」，
+   * 这字段是唯一的自证入口（也用于「服务端连接」卡片的输入框预填）。
+   */
+  server_base_url?: unknown
 }
 
 /**
@@ -148,22 +155,15 @@ export interface BondVisibility {
   /** 是否显示配对表单（服务端地址 / 配对码 / 设备名） */
   showPairingForm: boolean
   /**
-   * 是否显示原生登录表单（契约一：登录只在原生，2026-11 新增）。
+   * 是否显示「服务端连接」配置区（2026-11 新增）。
    *
-   * 只在「已配对**且**未登录」时为真：没配对先配对（配对码本身就是获取
-   * 会话的入口），已登录则无需登录表单。
+   * 恒为真：服务端地址是**随时可查可改**的配置项，不限配对态。
+   * 改造前它只在配对时出现一次，配对成功后界面上彻底看不到「我连的是哪台」，
+   * 换 IP 只能靠「解除配对」——把一个配置项变成了破坏性操作。
    */
-  showSignIn: boolean
+  showServerConfig: boolean
   /** 是否显示解除配对区块 */
   showUnpair: boolean
-  /**
-   * 是否显示「退出登录」。
-   *
-   * 只在「已配对**且**已登录」时为真：没登录就无从登出。
-   * 这条必须由 `signed_in` 单独驱动，不能用 `paired` 推断 ——
-   * 两者正交（旧服务端不签发会话时「已配对但未登录」是常态）。
-   */
-  showSignOut: boolean
 }
 
 /**
@@ -174,22 +174,26 @@ export interface BondVisibility {
  * 下用户最可能的诉求就是完成配对；而解除配对在读不出时本就该禁用，
  * 一并隐藏反而更清晰。
  *
- * 登出按钮在 `unknown` 时一律隐藏：读不出登录态就不该提供登出入口（fail-closed）。
+ * ## 2026-11：登录表单与登出按钮已从这里移除
+ *
+ * 桌面端「绑定即登录」：配对码由已登录账号在服务端签发，配对响应里携带来
+ * 用户会话（`user_token`），壳写进密钥链并注入 Cookie。所以不存在需要用户
+ * 在客户端输账号密码的环节，也不存在「已登录想退出」的独立诉求。
+ * 会话过期由设备令牌自动续期解决（见 hd-host `plan_reinject_step`），
+ * 而不是把用户推回一个登录表单 —— 后者正是本轮修的用户反馈。
  */
 export function bondVisibility(state: BondState): BondVisibility {
   switch (state.kind) {
     case 'paired':
       return {
         showPairingForm: false,
-        // 契约一：已配对未登录 → 显示原生登录表单（对齐移动端 /login 页）。
-        showSignIn: !state.signedIn,
+        showServerConfig: true,
         showUnpair: true,
-        showSignOut: state.signedIn,
       }
     case 'unpaired':
-      return { showPairingForm: true, showSignIn: false, showUnpair: false, showSignOut: false }
+      return { showPairingForm: true, showServerConfig: true, showUnpair: false }
     case 'unknown':
-      return { showPairingForm: true, showSignIn: false, showUnpair: false, showSignOut: false }
+      return { showPairingForm: true, showServerConfig: true, showUnpair: false }
   }
 }
 
@@ -204,13 +208,6 @@ export interface BondPresentation {
   title: string
   /** 解除配对按钮是否允许点击 */
   canUnpair: boolean
-  /**
-   * 退出登录按钮是否允许点击。
-   *
-   * 与 `canUnpair` 的区别是**语义边界**：登出只清会话、设备保持绑定，
-   * 所以它额外要求 `signedIn`；解绑则只要求 `paired`。
-   */
-  canSignOut: boolean
   /** reason 行的文案 */
   text: string
   /** reason 行的色调（对应 `is-ok` / `is-warn` / `is-error`） */
@@ -226,20 +223,23 @@ export const UNPAIRED_HINT = '当前未配对，无需解除。请先输入配�
  * ## 为什么要分这么细（而不是统一「请重新登录」）
  *
  * 用户在这个状态的下一步动作完全不同：
- * - `expired` / `network`：会话过期或这次没连上 → **多半再试一次就好**；
- * - `revoked` / `owner_unknown`：设备令牌被吊销 / 服务端不认这台设备的归属 →
- *   **重试无用，必须重新配对**。若这里也写「请重新登录」，用户会陷在登录页
- *   反复失败却永远不知道真正该做的是重新配对。
+ * - `expired` / `network`：会话过期或这次没连上 → **多半下次启动自动续期就好**
+ *   （壳会用设备令牌换新会话，无需用户做任何事）；
+ * - `revoked` / `owner_unknown` / `server_unpaired`：设备令牌被吊销 / 服务端
+ *   不认这台设备 → **重试无用，必须重新配对**。
  *
- * 未知原因（后端新增了前端还不认识的取值）回落到通用文案：宁可少说一句，
- * 也不能把「不知道」包装成一个可能错误的指引。
+ * ## 🔴 为什么文案里不再出现「请重新登录」
+ *
+ * 桌面端没有账号登录入口（绑定即登录，见 bondVisibility 文档）。若这里还写
+ * 「重新登录」，用户会在界面上**找不到**任何能登录的地方 —— 这是纯粹的误导。
+ * 会话恢复的路径只有两条：自动续期（过期/网络）与重新配对（吊销）。
  */
 export function sessionInvalidHint(reason: string | null): string {
   switch (reason) {
     case 'expired':
-      return '会话已过期且自动续期未成功，重新登录即可恢复。'
+      return '会话已过期，正在用本机设备令牌自动续期（无需操作）。'
     case 'network':
-      return '暂时连不上服务端，无法自动续期会话；网络恢复后重新登录即可。'
+      return '暂时连不上服务端，无法自动续期会话；网络恢复后会自动重试。'
     case 'revoked':
       return '设备授权已被服务端吊销，重试无效，需重新输入配对码绑定本机。'
     case 'server_unpaired':
@@ -249,7 +249,7 @@ export function sessionInvalidHint(reason: string | null): string {
     case 'owner_unknown':
       return '服务端无法确认本机归属的账号，需重新配对绑定账号后再使用。'
     default:
-      return '会话已失效，需重新登录；若反复失败请重新配对。'
+      return '会话已失效，正在尝试自动恢复；若反复失败请重新配对。'
   }
 }
 
@@ -267,35 +267,31 @@ export function presentBond(state: BondState): BondPresentation {
       return {
         title: '设备绑定 · 未绑定',
         canUnpair: false,
-        canSignOut: false,
         text: UNPAIRED_HINT,
         tone: 'warn',
       }
     case 'paired': {
       const id = state.deviceId ?? '（设备 ID 未上报）'
       const onlineText = state.online ? '在线' : '离线'
-      // 登录态与绑定态正交：已配对但未登录时，用户仍需在 Web UI 里登一次。
-      // 这正是「配对后免二次登录」要消除的那个多余动作 —— 有 user_token 时
-      // 后端已把 hg_sess 写进 WebView，故文案应明确告知「进去即可用」。
-      //
-      // 未登录还要再分两种（会话 7 天后过期 + 续期失败的真实缺陷）：
-      // ① 从来没有会话（旧服务端 / 历史配对码）→ 只需登录一次；
-      // ② 有过会话但失效了（sessionInvalid 非空）→ 要看原因，可能得重新配对。
+      // 账号信息只作为**只读事实**展示（「以谁的身份在用」），不再引导任何登录动作。
+      // 未登录还要再分两种（会话 7 天过期 + 续期失败的真实场景）：
+      // ① 从来没有会话（旧服务端 / 历史配对码）→ 壳会用设备令牌自动换一次；
+      // ② 有过会话但失效了（sessionInvalid 非空）→ 要看原因，吊销类必须重新配对。
       const account = state.signedIn
         ? `已登录${state.userLabel ? `为 ${state.userLabel}` : ''}，进入内置页面无需再次登录。`
         : state.sessionInvalid
           ? sessionInvalidHint(state.sessionInvalid)
-          : '尚未登录，进入内置页面需要先登录一次。'
-      // 失效且不可自愈（吊销 / 归属未知）→ 色调转 warn：这不只是一个提示，
-      // 而是一个需要用户动手的状态。可自愈的过期/网络问题仍保持 ok 色，
+          : '会话正在自动恢复（用本机设备令牌换取），无需手动登录。'
+      // 失效且不可自愈（吊销 / 归属未知 / 服务端解绑）→ 色调转 warn：这不只是
+      // 一个提示，而是一个需要用户动手的状态。可自愈的过期/网络问题仍保持 ok 色，
       // 免得用户每次开机都被一条黄字吓到。
       const faultNeedsAction =
-        state.sessionInvalid === 'revoked' || state.sessionInvalid === 'owner_unknown'
+        state.sessionInvalid === 'revoked' ||
+        state.sessionInvalid === 'owner_unknown' ||
+        state.sessionInvalid === 'server_unpaired'
       return {
         title: '设备绑定 · 已绑定',
         canUnpair: true,
-        // 只有已登录才谈得上登出
-        canSignOut: state.signedIn,
         text: `已绑定设备 ${id}（${onlineText}）。${account}解除后将清除本机令牌，需重新配对。`,
         tone: faultNeedsAction ? 'warn' : 'ok',
       }
@@ -304,7 +300,6 @@ export function presentBond(state: BondState): BondPresentation {
       return {
         title: '设备绑定 · 状态未知',
         canUnpair: false,
-        canSignOut: false,
         text: `${state.reason}：为避免误操作，解除配对已置灰。`,
         tone: 'error',
       }

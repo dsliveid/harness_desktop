@@ -569,6 +569,48 @@ fn baseline_url_snapshot(app: &tauri::AppHandle) -> Option<String> {
         .and_then(|st| st.baseline_url.read().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
+/// 服务端地址配置（查看当前 / 修改为新地址）。
+///
+/// ## 为什么这个命令必须存在（本轮修的真实缺口）
+///
+/// 改造前服务端地址**只在配对时填一次**，此后再无任何修改入口 —— 服务端换 IP
+/// 或换了部署机器，用户唯一的出路是「解除配对」再重新绑一次，把一个纯粹的
+/// 配置项变成了破坏性操作。界面上甚至看不到「我现在连的是哪台」。
+///
+/// ## 为什么改地址要清凭据并明确告知
+///
+/// 设备令牌是**某台服务端签发**的，换一台必然不被承认。静默保存地址会留下
+/// 「配置成功但永远离线」的死局，且界面没有任何线索指向「你换了服务器」。
+/// 故这里如实回 `requires_repair`，由基线页引导用户用新服务端配对码重新绑定。
+#[tauri::command]
+pub async fn set_server_base_url(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, HostState>,
+    server_base_url: String,
+) -> Result<crate::commands::SetServerUrlResponse, String> {
+    let resp = crate::commands::set_server_base_url(&state, &server_base_url)
+        .await
+        .map_err(err_str)?;
+
+    // 凭据被清空 = 本机已回到「未配对」，必须把窗口带回基线页配对入口。
+    // 否则用户会停在一个连不上的主界面上，还得自己找出口（而远程页面的
+    // 浮标依赖 ACL，见 build.rs 的 AppManifest 说明，不能作为唯一通道）。
+    if resp.requires_repair {
+        if let Some(w) = app.get_webview_window("main") {
+            if let Some(u) = baseline_url_snapshot(&app) {
+                if let Ok(parsed) = url::Url::parse(&u) {
+                    if let Err(e) = w.navigate(parsed) {
+                        // 导航失败不影响配置生效：用户仍可用托盘「返回设置界面」。
+                        tracing::warn!(error = %e, "切换服务端后回基线页失败");
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(resp)
+}
+
 
 
 /// 组装并运行 Tauri 应用。
@@ -611,7 +653,8 @@ pub fn run() -> tauri::Result<()> {
             open_settings,
             open_logs,
             open_web_ui,
-            open_baseline
+            open_baseline,
+            set_server_base_url
         ])
         .setup(|app| {
             // 🔴 会话 Cookie 通道注入：把 user_token 作为 hg_sess 写进 WebView，
@@ -682,9 +725,74 @@ pub fn run() -> tauri::Result<()> {
             //
             // 2026-11 契约三：菜单加「返回设置界面」。为什么放托盘：主窗口一旦
             // 导航到服务端 Web UI，基线页 DOM 被销毁，页面内按钮无从谈起；
-            // 托盘菜单不依赖 WebView 的 IPC（服务端远程页面的 invoke 可能因
-            // capability 未授权而不可用），是最保底的通道。
-            if let Ok(tray) = tauri::tray::TrayIconBuilder::with_id("main-tray").build(app) {
+            // 托盘菜单不依赖 WebView 的 IPC，是最保底的通道。
+            //
+            // 🔴 本轮修的真实缺陷：上面的注释承诺了菜单，但代码只 `build()` 了
+            // 图标、**从未 `menu()`**，于是托盘里空空如也 —— 用户一旦进了主界面，
+            // 除了关窗重开（还得靠会话自续运气好）就再无任何回到设置页的入口。
+            // 叠加远程页浮标曾被 ACL 拒绝（见 build.rs），这就是用户看到的
+            // 「点浮动设置按钮没反应，且没有别的路可走」的完整现场。
+            //
+            // 菜单项 id 用稳定短串：它同时是 `on_menu_event` 的分派键。
+            let tray_menu = tauri::menu::Menu::with_items(
+                app,
+                &[
+                    &tauri::menu::MenuItem::with_id(
+                        app,
+                        "open_baseline",
+                        "返回设置界面",
+                        true,
+                        None::<&str>,
+                    )
+                    .map_err(|e| e.to_string())?,
+                    &tauri::menu::PredefinedMenuItem::separator(app)
+                        .map_err(|e| e.to_string())?,
+                    &tauri::menu::MenuItem::with_id(
+                        app,
+                        "quit",
+                        "退出 harness 桌面端",
+                        true,
+                        None::<&str>,
+                    )
+                    .map_err(|e| e.to_string())?,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+
+            if let Ok(tray) = tauri::tray::TrayIconBuilder::with_id("main-tray")
+                .menu(&tray_menu)
+                // 左键也弹菜单：Windows 上用户分不清左右键，而托盘没有其它左键动作。
+                .show_menu_on_left_click(true)
+                .tooltip("harness_desktop")
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    // 与 IPC 的 `open_baseline` 走同一份快照导航逻辑：
+                    // 两个消费点必须同源，否则 dev/prod 地址形态差异会各自写死出错。
+                    "open_baseline" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.set_focus();
+                        }
+                        if let Some(u) = baseline_url_snapshot(app) {
+                            if let (Ok(parsed), Some(w)) =
+                                (url::Url::parse(&u), app.get_webview_window("main"))
+                            {
+                                match w.navigate(parsed) {
+                                    Ok(()) => tracing::info!("托盘：已返回基线页（设置界面）"),
+                                    Err(e) => tracing::warn!(error = %e, "托盘：返回基线页失败"),
+                                }
+                            }
+                        } else {
+                            // 无快照（极端时序）不该静默：至少把窗口拉出来给用户看到。
+                            tracing::warn!("托盘：无基线页快照，无法返回设置界面");
+                        }
+                    }
+                    "quit" => {
+                        tracing::info!("托盘：用户请求退出");
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)
+            {
                 // Tauri 2 的 set_tooltip 收 `Option<S>`（`None` 表示清除悬浮提示）。
                 let _ = tray.set_tooltip(Some("harness_desktop"));
             }

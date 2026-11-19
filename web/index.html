@@ -112,40 +112,53 @@
       </section>
 
       <!--
-        原生登录表单（契约一，2026-11）：已配对未登录时显示。
+        服务端连接配置（2026-11 新增，替代原先的「原生登录」卡片）。
 
-        为什么登录表单在基线页而不是 Web UI 里：对齐移动端「登录只在原生」铁律。
-        网页里登录产生的会话只进 WebView Cookie、不回写壳的密钥链 —— 原生与页面
-        两套账（移动端已修过的真实缺陷）。由壳发起登录：密码不经 JS 堆以外的
-        任何存储，令牌进密钥链，登出/自续状态机保持单一事实源。
+        ## 为什么这里不再是登录表单
 
-        显隐由 main.ts 按 device_status 驱动（plan_baseline_stage 判定），
-        与配对表单互斥：未配对先配对，已配对未登录才显示本卡。
+        桌面端的产品定位是「绑定即登录」：配对码由**已登录的账号**在服务端生成，
+        配对成功时服务端会一并下发用户会话令牌（`user_token` / `user` /
+        `session_ttl_s`），壳把它写进密钥链并注入 `hg_sess` Cookie。因此本机
+        一旦配对完成，就**已经**是登录态 —— 再要求用户在这里输一遍账号密码，
+        是纯多余的摩擦（移动端从未有过这一步，本轮对齐）。
+
+        真正需要兜底的是「会话过期」：它不是靠用户重新登录解决的，
+        而是壳用**设备令牌**自动换新会话（`POST /api/v1/devices/session`）。
+        见 hd-host `commands::plan_reinject_step` 与 `reinject_session_cookie`。
+
+        ## 为什么服务端地址放在这里
+
+        改造前地址只能在**配对时**填一次，配对成功后界面上再也看不到、也改不了：
+        服务端换 IP / 端口就只能「解除配对」再重绑（把配置项变成了破坏性操作）。
+        现在这里常显当前生效地址，并允许随时修改。
       -->
-      <section id="sign-in" class="card actions" hidden>
-        <strong class="line-title">账号登录</strong>
-        <p class="hint">本机已绑定设备，但尚未登录账号。登录后进入主界面无需再次登录。</p>
+      <section id="server-config" class="card actions" hidden>
+        <strong class="line-title">服务端连接</strong>
+        <p class="hint" id="server-current">正在读取当前服务端地址…</p>
 
         <div class="field">
-          <label for="sign-username">用户名</label>
+          <label for="server-url">服务端地址</label>
           <input
-            id="sign-username"
+            id="server-url"
             type="text"
-            autocomplete="username"
+            inputmode="url"
+            autocomplete="off"
             spellcheck="false"
-            maxlength="64"
+            placeholder="http://192.168.1.5:5611"
           />
-        </div>
-
-        <div class="field">
-          <label for="sign-password">密码</label>
-          <input id="sign-password" type="password" autocomplete="current-password" />
-          <span class="field-hint">密码只经 IPC 提交给壳，不落任何本地存储或日志</span>
+          <span class="field-hint">
+            留空则用默认 http://127.0.0.1:5611；跨机部署填服务端 IP，如
+            192.168.1.5:5611（协议与端口会自动补齐）
+          </span>
         </div>
 
         <div class="action">
-          <button type="button" data-cmd="sign_in" disabled>登录</button>
-          <p class="reason" data-reason-for="sign_in"></p>
+          <button type="button" data-cmd="set_server_base_url" disabled>保存并切换</button>
+          <p class="reason" data-reason-for="set_server_base_url"></p>
+          <p class="hint">
+            ⚠️ 切换服务端会清除本机设备令牌：令牌由原服务端签发，在新服务端上无效，
+            因此切换后需要用新服务端生成的配对码重新绑定本机。
+          </p>
         </div>
       </section>
 
@@ -158,9 +171,14 @@
         才发现没意义。判定逻辑见 src/desktop/deviceBond.ts。
         已配对时才显示（与上方配对表单互斥）。
 
-        「退出登录」与「解除配对」严格正交（对齐移动端 signOut / resetPairing）：
-        登出只清会话、保留设备绑定；解绑才回到需要配对。
-        两者的区别必须写在按钮旁边，否则用户想换账号时会误点解绑。
+        ## 2026-11：「退出登录」已移除
+
+        桌面端绑定即登录、从不暴露账号密码输入，因此不存在「已登录但想退出」的
+        独立状态 —— 登出后本机立刻变回「已配对但无会话」，而壳会在下次启动自动
+        用设备令牌换回来，用户点它只会得到一个「什么都没有发生」的结果。
+        保留它反而暗示「账号登录」这件事存在，与本轮的产品口径冲突。
+
+        想彻底脱离本机与账号的关系，用「解除配对」即可（它同时清设备令牌与会话）。
       -->
       <section id="device-binding" class="card actions danger" hidden>
         <strong class="line-title">设备绑定</strong>
@@ -171,12 +189,6 @@
           <button type="button" data-cmd="open_web_ui" disabled>进入主界面</button>
           <p class="reason" data-reason-for="open_web_ui"></p>
           <p class="hint">打开服务端 Web UI（已配对时自动免登录）。</p>
-        </div>
-
-        <div class="action" id="sign-out-row" hidden>
-          <button type="button" data-cmd="sign_out" disabled>退出登录</button>
-          <p class="reason" data-reason-for="sign_out"></p>
-          <p class="hint">仅退出账号，设备保持绑定，执行引擎继续在线。</p>
         </div>
 
         <div class="action">

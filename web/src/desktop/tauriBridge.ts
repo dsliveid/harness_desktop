@@ -43,11 +43,17 @@ export const COMMANDS = {
   /** 进入主界面：导航到服务端 Web UI（手动兜底入口，配对后免登录直达） */
   openWebUi: 'open_web_ui',
   /**
-   * 原生登录（契约一，2026-11）：登录只在原生（基线页表单），WebView 内不放
-   * 登录表单。密码只经 IPC 进 Rust，不落 JS 侧任何存储。
+   * 服务端地址配置（2026-11 新增）：查看当前地址、切换到新的服务端。
+   *
+   * 参数 `{ serverBaseUrl }`（Tauri 会把 snake_case 映射成 camelCase）。
+   * 地址变更会清除本机设备令牌（令牌由原服务端签发，新服务端不认），
+   * 返回 `requires_repair: true` 时界面需引导用户重新配对。
+   *
+   * 改造前服务端地址只在配对时填一次、此外无任何写入口：换 IP 只能「解除配对」，
+   * 把一个纯配置项变成了破坏性操作。本命令补齐这个缺口。
    */
-  signIn: 'sign_in',
-  /** 返回基线页（契约三）：从服务端 Web UI 回到设置/登录界面。 */
+  setServerBaseUrl: 'set_server_base_url',
+  /** 返回基线页（契约三）：从服务端 Web UI 回到设置界面。 */
   openBaseline: 'open_baseline',
   /** 设备/配对状态（`paired` / `online` / `device_id` …） */
   deviceStatus: 'device_status',
@@ -62,17 +68,6 @@ export const COMMANDS = {
    * `serverBaseUrl` 是**可选**的：壳缺省会回落 `http://127.0.0.1:5611`。
    */
   pairDevice: 'pair_device',
-  /**
-   * 退出登录（**保留设备绑定**）。
-   *
-   * 与 `unpairDevice` 严格正交（对齐移动端 `signOut` / `resetPairing`）：
-   * - 登出：清会话令牌 + Cookie，设备仍配对、执行引擎继续在线，重新登录即可。
-   * - 解绑：清设备令牌 + 会话令牌，相位回到「需要配对」。
-   *
-   * 把登出做成「连设备一起解绑」是移动端已踩过并修正的坑：用户只想换账号，
-   * 却被迫重新找配对码。
-   */
-  signOut: 'sign_out',
   /** 工作区白名单读写 */
   getWorkspaceRoots: 'get_workspace_roots',
   setWorkspaceRoots: 'set_workspace_roots',
@@ -409,36 +404,11 @@ export async function openLogs(): Promise<boolean> {
 /**
  * 进入主界面：壳把主窗口导航到服务端 Web UI。
  *
- * 已配对且登录态有效时是**免登录直达**（hg_sess Cookie 由壳维护）；
- * 未登录时会看到服务端登录页。返回 `null` 表示命令失败（无壳 / 壳太旧）。
+ * 已配对时会**免登录直达**（会话由壳用设备令牌维护，并注入 `hg_sess` Cookie）。
+ * 返回 `null` 表示命令失败（无壳 / 壳太旧）。
  */
 export async function openWebUi(): Promise<boolean> {
   return (await call<unknown>(COMMANDS.openWebUi)) !== null
-}
-
-/** `sign_in` 响应（对齐 Rust `SignInResponse`） */
-export interface SignInResult {
-  /** 是否已进入登录态（`false` = Cookie 写入失败等降级，界面保持表单） */
-  signedIn: boolean
-  /** 已登录账号展示名（未登录为 null） */
-  userLabel: string | null
-}
-
-/**
- * 原生登录（契约一）：提交用户名/密码，成功后壳落 vault + Cookie 并自动进主界面。
- *
- * 返回 `null` 表示命令失败（无壳 / 壳太旧 / 服务端拒绝 —— 后两者的错误文案
- * 由 callResult 的 reason 呈现，这里不用区分）。成功也未必已导航：
- * `signedIn=false` 是合法降级（Cookie 写入失败，重启自续会补）。
- */
-export async function signIn(username: string, password: string): Promise<SignInResult | null> {
-  const raw = await call<unknown>(COMMANDS.signIn, { username, password })
-  if (!raw || typeof raw !== 'object') return null
-  const rec = raw as { signed_in?: unknown; user_label?: unknown }
-  return {
-    signedIn: rec.signed_in === true,
-    userLabel: typeof rec.user_label === 'string' && rec.user_label.trim() !== '' ? rec.user_label.trim() : null,
-  }
 }
 
 /**

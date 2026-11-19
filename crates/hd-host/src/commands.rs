@@ -87,6 +87,19 @@ pub struct DeviceStatusResponse {
     /// 无失效事实时为 `None` —— 界面不应把它当成恒有字段。
     #[serde(default)]
     pub session_invalid: Option<String>,
+    /// 当前连接的服务端基址（`http://host:port`，**非凭据**，可安全回给界面）。
+    ///
+    /// ## 为什么放进 `device_status`
+    ///
+    /// 「我这台客户端到底在连哪台服务器」是排障与切换部署的第一事实，而改造前
+    /// 界面上**完全看不到**：地址只在配对时填过一次，之后只存在于
+    /// `<配置目录>/harness_desktop/profile.json` 里。用户想确认「是不是还连着
+    /// 旧的那台」只能去翻文件，跨机部署时无从自证。
+    ///
+    /// 这里回的是**实际生效值**（档案缺失时就是默认地址），与后端
+    /// [`profile_base_url`] 同源 —— 界面显示什么，客户端就真的连什么。
+    #[serde(default)]
+    pub server_base_url: String,
 }
 
 /// `runner_status` 的响应。
@@ -228,12 +241,37 @@ pub enum ReinjectStep {
 /// 由校验结论推导下一步动作（纯函数）。
 ///
 /// 契约（与需求逐字对齐）：
-/// - 没有令牌 → 无事可做；
+/// - 没有会话令牌 **且没有设备令牌** → 无事可做（真的未配对）；
 /// - 有效 → 直接写 Cookie；
-/// - 无效**或请求失败** → 走续期（服务端可能只是短暂不可达，续期是唯一自愈路径）。
-pub fn plan_reinject_step(verify: Option<SessionVerify>) -> ReinjectStep {
+/// - 无效**或请求失败** → 走续期（服务端可能只是短暂不可达，续期是唯一自愈路径）；
+/// - 没有会话令牌**但设备令牌还在** → 走续期（**本轮修的真实缺陷**）。
+///
+/// ## 🔴 为什么 `None` 也必须续期（免登录链路的断点）
+///
+/// 改造前这里是 `None => NoSession`，语义是「没有用户会话就什么都不做」。看起来
+/// 保守，实际把**设备绑定换会话**这条唯一自愈路径彻底掐断了：
+///
+/// ```text
+/// 场景：配对成功 → 用了一阵 → 会话 7 天过期被清（或配对时服务端没签发会话）
+/// 现状：启动自续看到「没会话」→ 直接放弃 → signed_in 恒 false
+///       → 基线页弹出「本机已绑定设备，但尚未登录账号，请先登录一次」
+///       → 用户被要求重新输入账号密码，而这台设备明明已经绑过了
+/// ```
+///
+/// 设备令牌（`device_token`）恰恰是服务端认可的、**唯一可用于换新会话**的凭据
+/// （`POST /api/v1/devices/session`）。既然它还在密钥链里，就应当拿它去换，
+/// 而不是把用户钉在登录页 —— 这正是「配对即免登录、桌面端不需要账号登录」的落点。
+///
+/// 真正无事可做的只有「既没会话也没设备令牌」，即从未配对。
+///
+/// @param verify            会话令牌校验结论（`None` = 密钥链里没有会话令牌）
+/// @param has_device_token  密钥链里是否有设备令牌（即是否已配对）
+pub fn plan_reinject_step(verify: Option<SessionVerify>, has_device_token: bool) -> ReinjectStep {
     match verify {
-        None => ReinjectStep::NoSession,
+        // 完全没有可用的东西 → 只有这时才真的无事可做。
+        None if !has_device_token => ReinjectStep::NoSession,
+        // 没有会话但设备令牌在 → 用设备令牌换一份新会话（本函数的核心修正）。
+        None => ReinjectStep::Renew,
         Some(SessionVerify::Valid) => ReinjectStep::Replay,
         // Invalid 与 Unreachable 都走续期：续期本身幂等可重试，
         // 且它是唯一能在「会话过期」时自愈的动作。
@@ -872,7 +910,11 @@ pub async fn reinject_session_cookie_with(
         None => None,
     };
 
-    match plan_reinject_step(verify) {
+    // 「是否已配对」是续期的前提事实：没有设备令牌就无从换新会话。
+    // 读密钥链失败按「无设备令牌」处理（fail-closed：不凭猜测量发起续期）。
+    let has_device_token = matches!(state.vault_ref().get(), Ok(Some(_)));
+
+    match plan_reinject_step(verify, has_device_token) {
         ReinjectStep::NoSession => ReinjectOutcome::NoSession,
 
         // ── 有效：保持旧行为，直接重放 ──────────────────────
@@ -1157,7 +1199,7 @@ pub fn list_commands() -> ListCommandsResponse {
 ///
 /// 🔴 增删 command 必须同步改这里 + `gui.rs` 的 `invoke_handler` 注册。
 /// 未实现的 `start_pairing` 之外的「禁止实现」三兄弟永不出现（见模块文档）。
-pub const SUPPORTED_COMMANDS: [&str; 15] = [
+pub const SUPPORTED_COMMANDS: [&str; 16] = [
     "list_commands",
     "device_status",
     "runner_status",
@@ -1178,6 +1220,9 @@ pub const SUPPORTED_COMMANDS: [&str; 15] = [
     // 登录只在原生（对齐移动端 §6.1 决策 2），WebView 内不放登录表单。
     "sign_in",
     "open_baseline",
+    // 服务端地址配置（本轮补齐）：配对后仍可查看与切换服务端 IP / 端口。
+    // 改造前地址只在配对时填一次、此外无任何写入口，换 IP 只能「解除配对」。
+    "set_server_base_url",
 ];
 
 /// 保留的 command 名清单（仅用于测试断言与文档，不注册）。
@@ -1312,6 +1357,9 @@ pub fn device_status(state: &HostState) -> DeviceStatusResponse {
         } else {
             state.session_invalid().map(|f| f.as_str().to_string())
         },
+        // 与实际生效地址同源（profile_base_url 已含「档案缺失回退默认」的逻辑），
+        // 界面据此显示「当前连接」，也用于「改地址」表单的初始值。
+        server_base_url: profile_base_url(),
     }
 }
 
@@ -1436,6 +1484,189 @@ fn profile_base_url() -> String {
         .map(|p| p.server_base_url)
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(crate::bootstrap::default_http_url)
+}
+
+/* ========================================================================
+ * 服务端地址配置（2026-11 补齐：配对后无处可改的缺口）
+ * ===================================================================== */
+
+/// 归一用户填写的服务端地址（纯函数，可穷举单测）。
+///
+/// ## 与前端的 `normalizeServerUrl` 的分工
+///
+/// 前端那份（`web/src/desktop/pairingForm.ts`）负责「即时校验 + 给用户看的原因」；
+/// 这里是**最后一道**：远程热更下发的旧前端可能不带校验，或有人直接调 IPC。
+/// 规则必须一致 —— 两边都补 `http://`、都剥路径、都补默认端口 5611。
+///
+/// ## 🔴 为什么必须剥掉 path / query
+///
+/// 后端所有调用点都是**字符串拼接**（`format!("{base}/api/v1/devices/pair")`）。
+/// 用户在输入框里粘贴 `http://host:5611/api/v1/devices` 是完全可能的（从文档复制），
+/// 直接拼会得到 `/api/v1/devices/api/v1/devices/pair` 这种必然 404 的地址，
+/// 而报错信息只会说「连接失败」，指向完全错误的方向。
+///
+/// ## 端口缺省补 5611 的边界
+///
+/// 只对 `http` 且**没写端口**时补。`https` 补 5611 几乎肯定是错的（公网部署走
+/// 443/反代）；用户显式写了端口则一律尊重。
+pub fn normalize_server_base_url(raw: &str) -> Result<String, CommandError> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(CommandError::BadServerUrl("地址不能为空".to_string()));
+    }
+
+    // 无 scheme 时补 http://。注意不能用「是否含 ':'」判断：端口本身带冒号
+    // （192.168.1.5:5611），按 "://" 判断才准确。
+    let with_scheme = if text.contains("://") {
+        text.to_string()
+    } else {
+        format!("http://{text}")
+    };
+
+    let parsed = url::Url::parse(&with_scheme)
+        .map_err(|e| CommandError::BadServerUrl(format!("无法解析：{e}")))?;
+
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(CommandError::BadServerUrl(format!(
+            "只支持 http/https，收到 {}",
+            parsed.scheme()
+        )));
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err(CommandError::BadServerUrl("缺少主机名".to_string()));
+    };
+    if host.is_empty() {
+        return Err(CommandError::BadServerUrl("缺少主机名".to_string()));
+    }
+
+    // 端口处理三档：
+    // - 用户显式写了端口 → 一律尊重（`https://host:8443` 保持 8443）；
+    // - http 且未写端口 → 补项目默认端口 5611（对齐 harness_go 的 Server.Addr = :5611）；
+    // - https 且未写端口 → 保持隐式 443，**不**画蛇添足补 :5611（公网部署必错）。
+    let port_part = match parsed.port() {
+        Some(p) => format!(":{p}"),
+        None if parsed.scheme() == "http" => ":5611".to_string(),
+        None => String::new(),
+    };
+
+    Ok(format!("{}://{host}{port_part}", parsed.scheme()))
+}
+
+/// `set_server_base_url` 的响应。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetServerUrlResponse {
+    /// 归一后实际保存的地址（界面据此回显「已保存为 xxx」，避免显示原始输入）。
+    pub server_base_url: String,
+    /// **切换服务端会导致令牌失效**，必须重新配对时为 `true`。
+    ///
+    /// ## 为什么需要这个字段
+    ///
+    /// 设备令牌是**某台服务端签发**的，换一台服务器它必然不被承认。若静默保存
+    /// 地址就结束，用户会陷入「配置看起来成功了，但设备一直离线且永远连不上」——
+    /// 而且界面上没有任何线索指向「你换了服务器」。所以这里如实告知，并把
+    /// 本地凭据清干净，让界面能明确引导「请用新服务端生成的配对码重新绑定」。
+    pub requires_repair: bool,
+    /// 给人看的说明（`requires_repair == false` 时为「地址未变，无需处理」一类）。
+    pub message: String,
+}
+
+/// `set_server_base_url`：查看/修改本机连接的服务端地址（**非凭据配置**）。
+///
+/// ## 为什么必须有这个命令（本轮修的真实缺口）
+///
+/// 改造前服务端地址**只在配对时填一次**：`Profile.server_base_url` 由
+/// `on_paired` 在配对成功时写入，此外**没有任何写入口**。后果很具体：
+/// - 服务端换了 IP / 端口 → 客户端连不上，而界面上无处可改，只能「解除配对」
+///   再重新输入配对码（把一个配置项变成了破坏性操作）；
+/// - 局域网部署先连错机器 → 同上，用户完全卡住。
+///
+/// ## 地址变更时的处置（顺序不可调换）
+///
+/// ```text
+/// ① 归一校验（不合法直接拒，不落盘的半成品配置比没配置更难排障）
+/// ② 与当前生效值相同 → 直接返回（幂等，用户重复点保存不该被清令牌）
+/// ③ 停 Runner（它握着旧地址与旧令牌，不停会一直对着旧服务端重连）
+/// ④ 清设备令牌 + 会话令牌 + Cookie（跨服务端一定无效）
+/// ⑤ 写档案（新地址 + 清空 ws_url / device_id 等派生字段）
+/// ⑥ requires_repair = true，界面引导重新配对
+/// ```
+///
+/// 为什么 ④ 在 ⑤ 之前：档案写入失败时，本地凭据已经被清掉 —— 这是**安全方向**
+/// （用户本来就要换服，旧令牌已无用）。反过来若先写档案再清令牌，写档案失败会
+/// 留下一份「地址已改、令牌还是旧服的」的不一致状态，反而更难收敛。
+pub async fn set_server_base_url(
+    state: &HostState,
+    raw_url: &str,
+) -> Result<SetServerUrlResponse, CommandError> {
+    use crate::profile::ProfileStore;
+
+    // ① 归一校验。
+    let next = normalize_server_base_url(raw_url)?;
+
+    // ② 地址没变 → 幂等返回，绝不清凭据。
+    // 这一步很重要：用户在「配置服务端」输入框里点了一下保存（值没改）就掉绑定，
+    // 是典型的「好心办坏事」—— 必须显式区分「改了」与「没改」。
+    let store = crate::profile::FileProfileStore::with_default_path();
+    let current_profile = store.load().ok().flatten();
+    let current = current_profile
+        .as_ref()
+        .map(|p| p.server_base_url.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(crate::bootstrap::default_http_url);
+
+    if normalize_server_base_url(&current).map(|c| c == next).unwrap_or(false) {
+        return Ok(SetServerUrlResponse {
+            server_base_url: next,
+            requires_repair: false,
+            message: "地址未变化，配置无需修改。".to_string(),
+        });
+    }
+
+    // ③ 停 Runner：它握着旧地址与旧令牌，不停会持续对着旧服务端重连（日志噪声 +
+    //    服务端侧看到一台永远认证失败的设备）。
+    state.daemon().shutdown().await;
+    state
+        .daemon()
+        .push_log(format!("[host] 服务端地址已变更为 {next}，正在清理旧凭据"));
+
+    // ④ 清凭据：设备令牌是**旧服务端**签发的，对新服务端毫无意义。
+    //    清不掉也继续（下面如实返回 requires_repair），但要让日志能查到。
+    if let Err(e) = state.vault.clear() {
+        tracing::warn!(error = %e, "切换服务端：清除设备令牌失败（仍需重新配对）");
+    }
+    if let Err(e) = state.user_vault.clear_user_token() {
+        tracing::warn!(error = %e, "切换服务端：清除用户会话失败（仍需重新配对）");
+    }
+    // Cookie 必须按**旧地址**清：新地址上根本没有旧 Cookie。
+    if let Err(e) = state.cookie_sink().clear_session_cookie(&current) {
+        tracing::warn!(error = %e, "切换服务端：清除旧地址的 hg_sess Cookie 失败");
+    }
+    state.set_user_label(None);
+    // 主动换服不是「会话失效」：清掉失效标记，界面才不会说「会话过期」误导用户。
+    state.set_session_invalid(None);
+
+    // ⑤ 写档案。🔴 派生字段一律清空：`ws_url` / `device_id` / `protocol_version`
+    //    都是旧服务端的产物，留着会让「重启自动连回」逻辑拿着一份错地址。
+    let written = crate::profile::Profile::new(
+        next.clone(),
+        String::new(),
+        String::new(),
+        0,
+        crate::daemon::now_ms(),
+    );
+    store
+        .save(&written)
+        .map_err(|e| CommandError::ProfileFailed(e.to_string()))?;
+
+    tracing::info!(url = %next, "服务端地址已保存（旧凭据已清除，等待重新配对）");
+
+    Ok(SetServerUrlResponse {
+        server_base_url: next.clone(),
+        requires_repair: true,
+        message: format!(
+            "已切换到 {next}。设备令牌由原服务端签发，在新服务端上无效，请用新服务端生成的配对码重新绑定本机。"
+        ),
+    })
 }
 
 
@@ -1673,6 +1904,15 @@ pub enum CommandError {
     /// 登录过程失败（网络、密钥链写入等）。
     #[error("登录失败：{0}")]
     SignInFailed(String),
+    /// 服务端地址不合法（无法解析 / 非 http(s) / 缺主机名）。
+    ///
+    /// 单独一个变体而不是并入 `PairFailed`：这是**纯本地校验**失败，用户改一下
+    /// 输入框就能过，与「配对打服务端失败」的处置完全不同。
+    #[error("服务端地址不合法：{0}")]
+    BadServerUrl(String),
+    /// 服务端档案读写失败（配置目录不可写、磁盘满）。
+    #[error("保存服务端配置失败：{0}")]
+    ProfileFailed(String),
 }
 
 /// `set_workspace_roots`：设置并归一工作区根，返回**归一后**的清单。
@@ -2859,20 +3099,93 @@ mod tests {
 
     #[test]
     fn plan_reinject_step_covers_all_verifications() {
-        assert_eq!(plan_reinject_step(None), ReinjectStep::NoSession);
+        // 既无会话也无设备令牌 = 从未配对 → 真的无事可做。
+        assert_eq!(plan_reinject_step(None, false), ReinjectStep::NoSession);
+        // 🔴 本轮修复的核心：没有会话但设备令牌还在 → 必须续期。
+        // 这是「配对即免登录」唯一的自愈路径；若这里退化成 NoSession，
+        // 已绑定用户会被永远钉在基线页的登录表单上（真实缺陷）。
         assert_eq!(
-            plan_reinject_step(Some(SessionVerify::Valid)),
+            plan_reinject_step(None, true),
+            ReinjectStep::Renew,
+            "已配对但会话丢失时必须用设备令牌换新会话，否则免登录不成立"
+        );
+        assert_eq!(
+            plan_reinject_step(Some(SessionVerify::Valid), true),
             ReinjectStep::Replay
         );
         assert_eq!(
-            plan_reinject_step(Some(SessionVerify::Invalid)),
+            plan_reinject_step(Some(SessionVerify::Invalid), true),
             ReinjectStep::Renew
         );
+        // 有会话令牌却「没设备令牌」在现实中不成立，但契约要穷举：
+        // 校验结论优先，有效就重放（不因配对态缺失而丢弃一份好会话）。
         assert_eq!(
-            plan_reinject_step(Some(SessionVerify::Unreachable)),
+            plan_reinject_step(Some(SessionVerify::Valid), false),
+            ReinjectStep::Replay
+        );
+        assert_eq!(
+            plan_reinject_step(Some(SessionVerify::Unreachable), true),
             ReinjectStep::Renew,
             "请求失败也必须续期：那是唯一能自愈的路径"
         );
+    }
+
+    #[test]
+    fn normalize_server_base_url_covers_real_inputs() {
+        // 用户最常填的形态：只有 IP:端口（无 scheme）→ 补 http://
+        assert_eq!(
+            normalize_server_base_url("192.168.1.5:5611").unwrap(),
+            "http://192.168.1.5:5611"
+        );
+        // 无端口 → 补默认 5611（用户少打端口是高频情况）
+        assert_eq!(
+            normalize_server_base_url("192.168.1.5").unwrap(),
+            "http://192.168.1.5:5611"
+        );
+        // 尾斜杠 / 路径 / query 必须剥掉：后端全是字符串拼接，带路径必 404
+        assert_eq!(
+            normalize_server_base_url("http://host:5611/").unwrap(),
+            "http://host:5611"
+        );
+        assert_eq!(
+            normalize_server_base_url("http://host:5611/api/v1/devices?x=1").unwrap(),
+            "http://host:5611",
+            "path 与 query 必须剥掉，否则拼接出必然 404 的地址"
+        );
+        // https 显式端口 → 尊重
+        assert_eq!(
+            normalize_server_base_url("https://harness.example.com:8443").unwrap(),
+            "https://harness.example.com:8443"
+        );
+        // https 无端口 → 保持隐式 443，绝不补 5611
+        assert_eq!(
+            normalize_server_base_url("https://harness.example.com").unwrap(),
+            "https://harness.example.com"
+        );
+        // 空白 → 明确拒绝（空地址不是「用默认」，而是用户没想清楚）
+        assert!(normalize_server_base_url("   ").is_err());
+        // 非 http(s) scheme → 拒绝
+        assert!(normalize_server_base_url("ftp://host:21").is_err());
+        assert!(normalize_server_base_url("ws://host:5611").is_err());
+    }
+
+    /// 🔴 前后端归一规则必须一致（同一输入 → 同一结果）。
+    ///
+    /// 前端 `normalizeServerUrl` 是用户看到的第一道校验，后端这里是最后一道。
+    /// 两边漂移的后果是「界面说合法、壳拒绝」或反之 —— 用户完全无法理解。
+    /// 本测试锁定后端口径，前端那份由 `web/test/pairingForm.test.mjs` 锁定。
+    #[test]
+    fn normalize_server_base_url_is_idempotent() {
+        for raw in [
+            "192.168.1.5:5611",
+            "http://host:5611",
+            "https://harness.example.com",
+            "https://harness.example.com:8443",
+        ] {
+            let once = normalize_server_base_url(raw).expect("应合法");
+            let twice = normalize_server_base_url(&once).expect("归一后必须仍合法");
+            assert_eq!(once, twice, "归一带幂等性：{raw} → {once} → {twice}");
+        }
     }
 
     #[test]

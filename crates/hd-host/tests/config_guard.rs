@@ -92,6 +92,134 @@ fn csp_allows_ipc_endpoints() {
     }
 }
 
+/// 🔴 双份真源守卫：`build.rs` 的 APP_COMMANDS 必须覆盖 `SUPPORTED_COMMANDS` 全部命令。
+///
+/// ## 为什么必须有这条测试
+///
+/// `build.rs` 是**独立编译单元**，无法 `use crate::commands::SUPPORTED_COMMANDS`，
+/// 只能把命令名再抄一遍喂给 `AppManifest`。而一旦声明了 AppManifest，
+/// `has_app_acl_manifest` 就为真，Tauri 会对**每一个**自定义命令做 ACL 校验：
+///
+/// ```ignore
+/// if (plugin_command.is_some() || has_app_acl_manifest || !is_local) && invoke.acl.is_none()
+/// ```
+///
+/// 漏抄一条的后果是那条命令**永久 ACL 拒绝**，而且症状极具误导性：命令明明注册了、
+/// 能力探测 `list_commands` 也报告支持，点下去却失败。上一轮「浮动设置按钮点了没反应」
+/// 就是这条链（当时是根本没声明 manifest，远程 origin 一律被拒）。
+///
+/// 所以这里把「两份清单必须一致」变成编译期即可发现的失败。
+#[test]
+fn app_manifest_covers_all_supported_commands() {
+    // build.rs 里的 APP_COMMANDS 列表（纯文本解析：它不可被 use，只能读文件）。
+    let build_rs = read_to_string("build.rs");
+    let list_start = build_rs
+        .find("const APP_COMMANDS: &[&str] = &[")
+        .expect("build.rs 里找不到 APP_COMMANDS 常量：AppManifest 声明被删了？");
+    let list_end = build_rs[list_start..]
+        .find("];")
+        .map(|i| list_start + i)
+        .expect("build.rs 的 APP_COMMANDS 数组没有闭合的 `];`");
+    let list_body = &build_rs[list_start..list_end];
+
+    let declared: Vec<String> = list_body
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(|s| s.to_string())
+        .collect();
+    assert!(
+        !declared.is_empty(),
+        "build.rs 的 APP_COMMANDS 解析为空，正则/格式已变更，请同步本测试"
+    );
+
+    // SUPPORTED_COMMANDS 的取值从这里读，避免在测试里再抄一遍。
+    let commands_rs = read_to_string("src/commands.rs");
+    let start = commands_rs
+        .find("pub const SUPPORTED_COMMANDS")
+        .expect("commands.rs 里找不到 SUPPORTED_COMMANDS");
+    let end = commands_rs[start..]
+        .find("];")
+        .map(|i| start + i)
+        .expect("SUPPORTED_COMMANDS 数组没有闭合的 `];`");
+    let supported: Vec<String> = commands_rs[start..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        // 数组长度在类型签名里（`[&str; 16]`），不含引号，故 split 出来的都是命令名
+        .map(|s| s.to_string())
+        .collect();
+
+    for cmd in &supported {
+        assert!(
+            declared.contains(cmd),
+            "🔴 命令 `{cmd}` 在 SUPPORTED_COMMANDS 里，但 build.rs 的 APP_COMMANDS 没有声明它。\n\
+             声明了 AppManifest 之后，Tauri 对每个自定义命令都做 ACL 校验，\n\
+             未声明的命令会被永久拒绝（`Command {cmd} not allowed by ACL`），\n\
+             且能力探测仍会报告「支持」，症状是「点了没反应」。\n\
+             修复：把 `{cmd}` 加入 crates/hd-host/build.rs 的 APP_COMMANDS，\n\
+             并同步在 capabilities/main.json 里加上 allow-{} 权限。",
+            cmd.replace('_', "-")
+        );
+    }
+
+    // 反向检查：APP_COMMANDS 里也不该有幽灵命令（写错的拼写会静默失效）。
+    for cmd in &declared {
+        assert!(
+            supported.contains(cmd),
+            "🔴 build.rs 声明了 `{cmd}`，但它不在 SUPPORTED_COMMANDS 里（拼写错误或已删除）。\n\
+             这本身不致故障，但会让权限文件生成一份永不使用的条目，掩盖真实漏项。"
+        );
+    }
+}
+
+/// 🔴 远程页面只能拿到「返回设置」这一个命令（最小权限）。
+///
+/// 远程内容是服务端下发、可被热更替换的，一旦给它配对/解绑/改地址的能力，
+/// 一个被篡改的远程包就能把客户端指向攻击者的服务器。这条测试把该边界钉死。
+#[test]
+fn remote_capability_is_minimal() {
+    let raw = read_to_string("capabilities/main-remote.json");
+    let cap: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("capabilities/main-remote.json 不是合法 JSON：{e}"));
+
+    let perms: Vec<String> = cap
+        .get("permissions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    assert_eq!(
+        perms,
+        vec!["allow-open-baseline".to_string()],
+        "🔴 远程 capability 只能有 allow-open-baseline 一项权限，当前为 {perms:?}。\n\
+         服务端 Web UI 内的浮标只需要「返回本地设置页」；给它更多权限等于把\n\
+         配对/解绑/改服务端地址这些副作用动作暴露给可被热更替换的远程代码。"
+    );
+
+    // local 必须显式为 false：这是「只对远程页面生效」的开关。
+    assert_eq!(
+        cap.get("local").and_then(|v| v.as_bool()),
+        Some(false),
+        "🔴 capabilities/main-remote.json 必须 `local: false`，否则这份「最小权限」\n\
+         会同时作用于本地基线页，把配对/解绑等全部功能一并锁死。"
+    );
+
+    // remote.urls 必须存在：没有它，远程 origin 根本匹配不到这个 capability。
+    assert!(
+        cap.get("remote")
+            .and_then(|v| v.get("urls"))
+            .and_then(|v| v.as_array())
+            .is_some(),
+        "🔴 capabilities/main-remote.json 缺少 remote.urls：远程页面将匹配不到任何\n\
+         capability，浮标又会退化成「点了没反应」。"
+    );
+}
+
 /// 内置基线产物：**存在则校验不滞后，不存在则跳过**。
 ///
 /// ## 为什么必须是「条件断言」而不是硬断言

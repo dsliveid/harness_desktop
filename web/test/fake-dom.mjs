@@ -182,33 +182,35 @@ export function createDocument() {
   // 初始隐藏：真实 HTML 带 hidden，由 device_status 决定是否显示
   pairing.hidden = true
 
-  // 原生登录表单（契约一，2026-11）：已配对未登录时显示，与配对表单互斥。
-  // id="sign-in" 必须与真实 index.html 一致（assertHtmlCoverage 反查覆盖）。
-  // 🔴 放在 danger 声明**之前**没问题 —— 它不引用 danger（只有 device-binding
-  // 卡片内的桩要挂在 danger 下才受 TDZ 约束）。
-  const signInSection = new FakeElement('section', { id: 'sign-in', className: 'card actions' })
-  const signInTitle = new FakeElement('strong', { className: 'line-title' })
-  const signUsername = new FakeElement('input', { id: 'sign-username', value: '' })
-  const signPassword = new FakeElement('input', { id: 'sign-password', value: '' })
-  signInSection.append(signInTitle)
-  for (const input of [signUsername, signPassword]) {
+  // 服务端连接配置区（2026-11 新增，替代原先的「原生登录」表单）。
+  // id="server-config" 必须与真实 index.html 一致（assertHtmlCoverage 反查覆盖）。
+  // 该区块**常显**（配对态无关），因为它承载「我在连哪台服务器」这个随时要查的事实。
+  const serverConfig = new FakeElement('section', {
+    id: 'server-config',
+    className: 'card actions',
+  })
+  const serverConfigTitle = new FakeElement('strong', { className: 'line-title' })
+  const serverCurrent = new FakeElement('p', { id: 'server-current', className: 'hint' })
+  const serverUrl = new FakeElement('input', { id: 'server-url', value: '' })
+  serverConfig.append(serverConfigTitle, serverCurrent)
+  {
     const field = new FakeElement('div', { className: 'field' })
-    field.append(input)
-    signInSection.append(field)
+    field.append(serverUrl)
+    serverConfig.append(field)
   }
   {
     const wrap = new FakeElement('div', { className: 'action' })
-    const btn = new FakeElement('button', { dataset: { cmd: 'sign_in' } })
+    const btn = new FakeElement('button', { dataset: { cmd: 'set_server_base_url' } })
     const reason = new FakeElement('p', {
       className: 'reason',
-      dataset: { reasonFor: 'sign_in' },
+      dataset: { reasonFor: 'set_server_base_url' },
     })
     wrap.append(btn, reason)
-    signInSection.append(wrap)
-    buttons['sign_in'] = { btn, reason }
+    serverConfig.append(wrap)
+    buttons['set_server_base_url'] = { btn, reason }
   }
-  // 初始隐藏：与配对表单同款（device_status 决定显隐）
-  signInSection.hidden = true
+  // 真实 HTML 里它带 hidden，由 device_status 驱动显示（showServerConfig 恒真）。
+  serverConfig.hidden = true
 
   // 危险操作区块（解除配对）：结构同 actions，但独立成一块以匹配真实布局。
   // id="device-binding" 必须与真实 index.html 一致 —— assertHtmlCoverage() 会反查，
@@ -235,20 +237,9 @@ export function createDocument() {
     buttons['open_web_ui'] = { btn, reason }
   }
 
-  // 「退出登录」行：仅已配对且已登录时显示（id 必须与真实 index.html 一致）。
-  // 独立成一行而不与解绑混排 —— 两者语义正交，混在一起用户会误点解绑。
-  const signOutRow = new FakeElement('div', { id: 'sign-out-row', className: 'action' })
-  signOutRow.hidden = true
-  {
-    const btn = new FakeElement('button', { dataset: { cmd: 'sign_out' } })
-    const reason = new FakeElement('p', {
-      className: 'reason',
-      dataset: { reasonFor: 'sign_out' },
-    })
-    signOutRow.append(btn, reason)
-    danger.append(signOutRow)
-    buttons['sign_out'] = { btn, reason }
-  }
+  // 「退出登录」已移除（2026-11）：桌面端绑定即登录、不暴露账号密码，也就不存在
+  // 「已登录想退出」的独立诉求 —— 登出后壳会在下次启动用设备令牌换回会话，
+  // 用户点它只会得到「什么都没发生」。想彻底断开用「解除配对」。
 
   for (const cmd of ['unpair_device']) {
     const wrap = new FakeElement('div', { className: 'action' })
@@ -266,7 +257,7 @@ export function createDocument() {
   const foot = new FakeElement('footer', { className: 'foot' })
   foot.append(diag)
 
-  app.append(server, runner, capability, actions, pairing, signInSection, danger, foot)
+  app.append(server, runner, capability, actions, pairing, serverConfig, danger, foot)
 
   const doc = {
     readyState: 'loading',

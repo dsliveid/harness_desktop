@@ -37,6 +37,7 @@ import {
   DEFAULT_SERVER_URL,
   describePairedSuccess,
   normalizePairCode,
+  normalizeServerUrl,
   validatePairing,
 } from '../desktop/pairingForm'
 import { describe, describeWithRestarts, type PhaseTone } from '../desktop/runnerPhase'
@@ -134,14 +135,12 @@ const BUTTON_COMMANDS = [
   COMMANDS.openLogs,
   // 进入主界面：手动兜底导航入口（配对/自续成功时壳会自动导航，这里是重试通道）。
   COMMANDS.openWebUi,
-  // 原生登录（契约一）：登录只在原生，基线页表单提交走这个命令。
-  COMMANDS.signIn,
+  // 服务端地址配置：旧壳没有该命令时必须置灰并说明，而不是点了才失败。
+  COMMANDS.setServerBaseUrl,
   // 解绑按钮也要参与能力探测：壳太旧时它必须置灰，而不是点了才报错。
   COMMANDS.unpairDevice,
   // 配对按钮同理：旧壳没有 pair_device 时必须置灰并说明，而不是点了才失败。
   COMMANDS.pairDevice,
-  // 登出按钮：旧壳没有 sign_out 时置灰（与解绑区分，不能混淆两者）
-  COMMANDS.signOut,
 ] as const
 
 /**
@@ -176,20 +175,12 @@ function businessGate(
     return null
   }
 
-  // 登录：要求表单两项非空（与配对同款「能力 ≠ 此刻允许」分层）。
-  // formReason 现在是「配对表单 OR 登录表单」 whichever 有校验失败；
-  // 登录卡片不可见时它的 reason 由 renderDeviceBinding 恢复空白，互不干扰。
-  if (cmd === COMMANDS.signIn) {
-    const signInReason = refreshSignInValidation()
-    if (signInReason !== null) return { text: signInReason, tone: 'warn' }
+  // 服务端地址保存：要求输入能归一成合法 URL（与壳侧同一套规则）。
+  // 空输入视为「用默认地址」，不算非法 —— 与配对表单的 serverUrl 同口径。
+  if (cmd === COMMANDS.setServerBaseUrl) {
+    const reason = refreshServerUrlValidation()
+    if (reason !== null) return { text: reason, tone: 'warn' }
     return null
-  }
-
-  // 退出登录：要求「已配对且已登录」（没登录就无从登出）
-  if (cmd === COMMANDS.signOut) {
-    if (!bond) return { text: '正在读取设备绑定状态…', tone: 'warn' }
-    if (bond.canSignOut) return null
-    return { text: bond.text, tone: bond.tone }
   }
 
   return null
@@ -445,14 +436,26 @@ function bindActions(): void {
   }
 
   // 登录表单即时校验：与配对表单同款取向（边输入边更新门禁）。
-  for (const id of ['#sign-username', '#sign-password']) {
-    el<HTMLInputElement>(id)?.addEventListener('input', () => {
+  // 🔴 2026-11 移除：桌面端改为「绑定即登录」，基线页不再有账号密码输入
+  // （详见 deviceBond.ts 的 bondVisibility 文档）。取而代之的是服务端地址
+  // 配置区，它的即时校验见下方 server-url 的 input 监听。
+
+  // 服务端地址配置区：即时校验 + 用当前生效地址预填。
+  // 预填很关键：用户需要看到「我现在连的是哪台」，而不是一个空输入框。
+  const serverUrlInput = el<HTMLInputElement>('#server-url')
+  if (serverUrlInput) {
+    serverUrlInput.addEventListener('input', () => {
+      // 标记「用户已动过这个框」：之后的状态刷新不再覆盖他的输入。
+      // 否则用户正改到一半、某次 refresh 就会把值重置回服务端地址 —— 极烦人。
+      serverUrlInput.dataset['touched'] = '1'
+      refreshServerUrlValidation()
       refreshActionsWithCurrentState()
     })
-    // 密码框回车直接提交（对齐移动端 onFieldSubmitted）。
-    el<HTMLInputElement>(id)?.addEventListener('keydown', (ev) => {
+    serverUrlInput.addEventListener('keydown', (ev) => {
       if ((ev as KeyboardEvent).key === 'Enter') {
-        const btn = document.querySelector<HTMLButtonElement>('button[data-cmd="sign_in"]')
+        const btn = document.querySelector<HTMLButtonElement>(
+          `button[data-cmd="${COMMANDS.setServerBaseUrl}"]`,
+        )
         if (btn && !btn.disabled) void handleAction(btn)
       }
     })
@@ -471,11 +474,10 @@ const ACTION_FEEDBACK: Record<string, string> = {
   [COMMANDS.checkUpdate]: '已请求检查更新（若壳返回新版本会另行提示）',
   [COMMANDS.openSettings]: '已请求打开设置页',
   [COMMANDS.openLogs]: '已请求打开日志',
-  [COMMANDS.openWebUi]: '正在打开主界面…（已配对且登录态有效时免登录直达）',
-  // 登录成功走专门分支（submitSignIn）给出带账号名的文案；这里是兜底。
-  [COMMANDS.signIn]: '已提交登录',
+  [COMMANDS.openWebUi]: '正在打开主界面…（已配对时会自动免登录直达）',
+  // 服务端地址成功分支走 submitServerUrl（带壳侧返回的人话）；这里是兜底。
+  [COMMANDS.setServerBaseUrl]: '已保存服务端地址',
   [COMMANDS.unpairDevice]: '已解除配对：设备令牌已清除，请重新输入配对码完成绑定',
-  [COMMANDS.signOut]: '已退出登录：设备仍保持绑定，已返回设置界面，可重新登录',
   // 工作区设置是**三态**命令（见 handleWorkspaceRootsResult），这里的文案只覆盖
   // 「已保存并同步」那一档；另两档由判据分支给出，故不放进这张表。
   [COMMANDS.setWorkspaceRoots]: '已保存并同步到执行引擎',
@@ -631,88 +633,106 @@ async function submitPairing(reasonBox: HTMLElement): Promise<void> {
 }
 
 /**
- * 执行原生登录（契约一）。
- *
- * 与 submitPairing 同款结构：提交中置 busy → 刷新门禁 → 显式分支收口写反馈
- * （try/finally + return 会吞掉补写，历史踩过的坑不复述）。
- *
- * 成功文案带账号名：用户要能确认「以谁的身份登录」；signedIn=false（Cookie
- * 写入失败等降级）不算失败，但必须说清「下次启动会自动重试」。
+ * 读取服务端地址输入框当前值（供门禁与提交复用，避免两处漂移）。
  */
-async function submitSignIn(reasonBox: HTMLElement): Promise<void> {
-  const username = el<HTMLInputElement>('#sign-username')?.value ?? ''
-  const password = el<HTMLInputElement>('#sign-password')?.value ?? ''
+function readServerUrlInput(): string {
+  return el<HTMLInputElement>('#server-url')?.value ?? ''
+}
 
-  // 前端先拦空输入：空值连 IPC 都不必发（与壳侧校验同口径）。
-  if (username.trim() === '' || password === '') {
-    reasonBox.textContent = username.trim() === '' ? '请输入用户名' : '请输入密码'
-    reasonBox.className = toneToReasonClass('warn')
+/**
+ * 服务端地址校验（前端第一道，壳侧 `normalize_server_base_url` 是第二道）。
+ *
+ * 复用配对表单的 `normalizeServerUrl` —— 两条路径必须同一套规则，否则会出现
+ * 「配对被拒、改地址却通过」这种自相矛盾的体验。
+ *
+ * @returns 失败原因（`null` = 合法）
+ */
+function refreshServerUrlValidation(): string | null {
+  const input = el<HTMLInputElement>('#server-url')
+  const result = normalizeServerUrl(readServerUrlInput())
+  input?.classList.toggle('is-invalid', !result.ok)
+  return result.ok ? null : result.reason
+}
+
+/**
+ * 提交服务端地址变更（**会清设备令牌，必须先二次确认**）。
+ *
+ * ## 为什么必须显式确认
+ *
+ * 改地址会清掉设备令牌（令牌由原服务端签发，新服务端不认），本机随之回到
+ * 「未配对」。这比「解除配对」更隐蔽 —— 用户往往只想着「改个 IP」，
+ * 并不知道会掉绑定。所以确认文案必须把后果说全。
+ *
+ * ## 「地址没变」是一条正常路径，不是失败
+ *
+ * 壳侧对同一地址是幂等的（返回 `requires_repair: false`）。界面必须把这种情况
+ * 如实表达为「无需修改」，而不是报错 —— 用户很可能只是想确认当前配置。
+ */
+async function submitServerUrl(reasonBox: HTMLElement): Promise<void> {
+  const validation = normalizeServerUrl(readServerUrlInput())
+  if (!validation.ok) {
+    reasonBox.textContent = validation.reason
+    reasonBox.className = toneToReasonClass('error')
     return
   }
 
-  busyCommand = COMMANDS.signIn
+  const confirmed = globalThis.confirm(
+    `确定把服务端切换为 ${validation.url} 吗？\n\n` +
+      '切换会清除本机保存的设备令牌（令牌由原服务端签发，新服务端无法识别），' +
+      '本机将回到「未配对」状态，需要用新服务端生成的配对码重新绑定。',
+  )
+  if (!confirmed) return
+
+  busyCommand = COMMANDS.setServerBaseUrl
   refreshActionsWithCurrentState()
 
   let outcome: { ok: boolean; text: string }
   try {
-    const result = await callResult<unknown>(COMMANDS.signIn, { username, password })
+    const result = await callResult<unknown>(COMMANDS.setServerBaseUrl, {
+      serverBaseUrl: validation.url,
+    })
     if (result.ok) {
-      const info = normalizeSignInResult(result.value)
-      outcome = info?.signedIn
-        ? {
-            ok: true,
-            text: `登录成功${info.userLabel ? `（${info.userLabel}）` : ''}，正在进入主界面…`,
-          }
-        : { ok: true, text: '登录成功，但内置页面凭据未能本次写入；下次启动会自动重试' }
+      const info = normalizeServerUrlResult(result.value)
+      outcome = {
+        ok: true,
+        text: info?.message ?? `已保存服务端地址 ${validation.url}`,
+      }
     } else {
       outcome = { ok: false, text: result.reason }
     }
   } catch (err) {
-    outcome = { ok: false, text: `登录失败：${String(err)}` }
+    outcome = { ok: false, text: `保存失败：${String(err)}` }
   }
 
   busyCommand = null
-  // 成功与否都刷新：成功后登录卡片要隐藏、登出按钮要出现、主界面即将导航。
+  // 无论成功与否都刷新：成功后绑定态会变成「未配对」，配对表单要出现。
   await refreshStatusPanels()
   reasonBox.textContent = outcome.text
   reasonBox.className = toneToReasonClass(outcome.ok ? 'ok' : 'error')
 }
 
-/** 读取登录表单当前输入（供门禁复用） */
-function readSignInInput(): { username: string; password: string } {
-  return {
-    username: el<HTMLInputElement>('#sign-username')?.value ?? '',
-    password: el<HTMLInputElement>('#sign-password')?.value ?? '',
-  }
-}
-
 /**
- * 登录表单校验（前端第一道，壳侧还有第二道）：两项非空才放行。
- * @returns 失败原因（`null` = 合法）
+ * 归一 `set_server_base_url` 响应（宽松，永不 throw —— 对齐其它归一函数）。
  */
-function refreshSignInValidation(): string | null {
-  const input = readSignInInput()
-  const usernameEmpty = input.username.trim() === ''
-  const passwordEmpty = input.password === ''
-  el<HTMLInputElement>('#sign-username')?.classList.toggle('is-invalid', usernameEmpty)
-  el<HTMLInputElement>('#sign-password')?.classList.toggle('is-invalid', passwordEmpty)
-  if (usernameEmpty) return '请输入用户名'
-  if (passwordEmpty) return '请输入密码'
-  return null
-}
-
-/**
- * 归一 `sign_in` 响应（宽松，永不 throw —— 对齐 normalizeCheckUpdateResult）。
- */
-function normalizeSignInResult(raw: unknown): { signedIn: boolean; userLabel: string | null } | null {
+function normalizeServerUrlResult(
+  raw: unknown,
+): { serverBaseUrl: string; requiresRepair: boolean; message: string } | null {
   if (!raw || typeof raw !== 'object') return null
-  const rec = raw as { signed_in?: unknown; user_label?: unknown }
+  const rec = raw as {
+    server_base_url?: unknown
+    requires_repair?: unknown
+    message?: unknown
+  }
+  const url = typeof rec.server_base_url === 'string' ? rec.server_base_url.trim() : ''
   return {
-    signedIn: rec.signed_in === true,
-    userLabel:
-      typeof rec.user_label === 'string' && rec.user_label.trim() !== ''
-        ? rec.user_label.trim()
-        : null,
+    serverBaseUrl: url,
+    requiresRepair: rec.requires_repair === true,
+    message:
+      typeof rec.message === 'string' && rec.message.trim() !== ''
+        ? rec.message.trim()
+        : url
+          ? `已保存服务端地址 ${url}`
+          : '服务端地址已保存',
   }
 }
 
@@ -729,10 +749,10 @@ async function handleAction(btn: HTMLButtonElement): Promise<void> {
     return
   }
 
-  // 登录走独立路径：同样需要多参数，成功后要切换整块 UI 并自动进主界面。
-  if (cmd === COMMANDS.signIn) {
+  // 服务端地址：同样需要多参数，且成功后绑定态会变为「未配对」，要切换整块 UI。
+  if (cmd === COMMANDS.setServerBaseUrl) {
     if (!reasonBox) return
-    await submitSignIn(reasonBox)
+    await submitServerUrl(reasonBox)
     return
   }
 
@@ -762,11 +782,9 @@ async function handleAction(btn: HTMLButtonElement): Promise<void> {
   // 三档判定集中在 describeActionResultV2（ok / warn / error），红字只留给真故障。
   applyActionResult(cmd, result, reasonBox)
 
-  // 解绑/登出成功后刷新状态卡：
-  // - 解绑：相位已切到 needs_pairing，绑定状态与按钮门禁都变了；
-  // - 登出：signed_in 变 false，登出按钮该消失、文案要改成「需要登录一次」。
+  // 解绑成功后刷新状态卡：相位已切到 needs_pairing，绑定状态与按钮门禁都变了。
   // 判定用 result.ok —— 不能再写 `result !== null`：成功返回 null 的场景会漏刷新。
-  if ((cmd === COMMANDS.unpairDevice || cmd === COMMANDS.signOut) && result.ok) {
+  if (cmd === COMMANDS.unpairDevice && result.ok) {
     await refreshStatusPanels()
     // 刷新会按门禁重写 reason 行（登出按钮会更成「尚未登录」的说明），
     // 但用户刚点的这次操作结果更该被看到，故在刷新后重新落实文案。
@@ -777,11 +795,11 @@ async function handleAction(btn: HTMLButtonElement): Promise<void> {
 /* ============ 设备绑定 ============ */
 
 /**
- * 读取设备绑定状态并渲染「设备绑定」卡片 + 配对表单的显隐。
+ * 读取设备绑定状态并渲染「设备绑定」卡片 + 各区块显隐。
  *
  * 🔴 这个函数的存在本身就是缺陷修复：基线界面原先从未调用 `device_status`，
  * 于是「解除配对」按钮的可点性只受能力探测控制，未配对时也照样可点。
- * 现在它同时驱动**两个互斥区块**（配对表单 / 解除配对）的显隐。
+ * 现在它同时驱动**多个互斥区块**（配对表单 / 服务端配置 / 解除配对）的显隐。
  *
  * @returns 当前呈现方案（供按钮门禁复用），读取失败时返回 unknown 态
  */
@@ -791,19 +809,33 @@ async function renderDeviceBinding(): Promise<ReturnType<typeof presentBond>> {
   const view = presentBond(state)
   const visibility = bondVisibility(state)
 
-  // 区块互斥：未配对显示配对表单、已配对显示解除配对。
+  // 服务端地址：**未配对时也要能显示**（用户正是要靠它来确认该连哪台、
+  // 或切换部署）。故不走 BondState 的 paired 分支，直接从原始响应里取 ——
+  // `parseDeviceStatus` 的 paired 分支只承载「账号/会话」这类与绑定强相关的事实。
+  serverBaseUrlSeen = raw.ok ? readServerBaseUrl(raw.value) : null
+
+  // 区块显隐：未配对显示配对表单、已配对显示解除配对。
   // 同屏同时出现「立即配对」和「解除配对」会让用户不知道该点哪个。
   const pairingSection = el<HTMLElement>('#pairing')
   if (pairingSection) pairingSection.hidden = !visibility.showPairingForm
-  // 原生登录卡片（契约一）：已配对未登录时显示，与配对/解除配对互斥。
-  const signInSection = el<HTMLElement>('#sign-in')
-  if (signInSection) signInSection.hidden = !visibility.showSignIn
+  // 服务端连接配置：恒显示（配对态无关），它是随时可查可改的配置项。
+  const serverSection = el<HTMLElement>('#server-config')
+  if (serverSection) serverSection.hidden = !visibility.showServerConfig
   const bindingSection = el<HTMLElement>('#device-binding')
   if (bindingSection) bindingSection.hidden = !visibility.showUnpair
-  // 登出行：仅在「已配对且已登录」时出现。未登录就无从登出，
-  // 显示一个永远置灰的按钮只会让人困惑（为什么点了没反应）。
-  const signOutRow = el<HTMLElement>('#sign-out-row')
-  if (signOutRow) signOutRow.hidden = !visibility.showSignOut
+
+  // 当前生效地址回显 + 输入框预填（只在输入框为空或用户没在编辑时预填，
+  // 否则会打断正在输入的人 —— 用户改了半截地址、刷新一次就被覆盖，体验极差）。
+  const currentLine = el<HTMLElement>('#server-current')
+  if (currentLine) {
+    currentLine.textContent = serverBaseUrlSeen
+      ? `当前连接：${serverBaseUrlSeen}`
+      : '正在读取当前服务端地址…'
+  }
+  const serverInput = el<HTMLInputElement>('#server-url')
+  if (serverInput && !serverInput.dataset['touched'] && serverBaseUrlSeen) {
+    serverInput.value = serverBaseUrlSeen
+  }
 
   // 卡片标题：把「已绑定 / 未绑定」直接写进标题，用户不必去读下面那行小字。
   const title = document.querySelector<HTMLElement>('#device-binding .line-title')
@@ -815,11 +847,11 @@ async function renderDeviceBinding(): Promise<ReturnType<typeof presentBond>> {
     reasonBox.className = toneToReasonClass(view.tone)
   }
 
-  // 配对表单出现后，立即按当前（预填的）输入算一次门禁，
+  // 表单出现后，立即按当前（预填的）输入算一次门禁，
   // 否则「立即配对」会停在 HTML 里的初始 disabled 上，用户还以为不许点。
   if (visibility.showPairingForm) refreshPairingValidation()
-  // 登录卡片同理：显示时立即校验一次，让「登录」按钮立即反映当前输入状态。
-  if (visibility.showSignIn) refreshSignInValidation()
+  // 服务端地址同理：显示时立即校验一次，让「保存并切换」立即反映当前输入状态。
+  if (visibility.showServerConfig) refreshServerUrlValidation()
 
   return view
 }
@@ -849,6 +881,27 @@ function refreshActionsWithCurrentState(): void {
   if (!lastCapStates) return
   const bond = lastBond
   applyCapability(lastCapStates, bond, refreshPairingValidation(), busyCommand)
+}
+
+/**
+ * 最近一次读到的服务端地址（`null` = 尚未读到 / 读取失败）。
+ *
+ * 单独一个变量而不是塞进 `BondState`：地址在**未配对时同样有意义**
+ * （用户正是要靠它确认该连哪台、或切换部署），而 `BondState` 的 paired 分支
+ * 只承载「账号/会话」这类与绑定强相关的事实。
+ */
+let serverBaseUrlSeen: string | null = null
+
+/**
+ * 从 `device_status` 原始响应里取服务端地址（宽松解析，绝不 throw）。
+ *
+ * 为什么宽松：远程热更的 UI 可能跑在旧壳上，字段缺失属正常降级，
+ * 界面回落到「正在读取…」即可，不该因此把整张卡片渲染成错误态。
+ */
+function readServerBaseUrl(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object') return null
+  const value = (raw as { server_base_url?: unknown }).server_base_url
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null
 }
 
 /** 上一次的能力探测结果（供 `refreshActionsWithCurrentState` 复用） */

@@ -191,7 +191,7 @@ test('signed_in=true 但 user_label 缺失：仍算已登录，只是不显示�
   assert.doesNotMatch(view.text, /为 |undefined|null/)
 })
 
-test('signed_in 缺失（旧服务端）：降级为未登录，提示仍需登录一次', async () => {
+test('signed_in 缺失（旧服务端）：降级为未登录，文案引导自动恢复', async () => {
   const { parseDeviceStatus, presentBond } = await load()
 
   // 这是兼容性核心断言：老壳/老服务端不会返回 signed_in，
@@ -204,8 +204,10 @@ test('signed_in 缺失（旧服务端）：降级为未登录，提示仍需登�
   assert.equal(state.userLabel, null)
 
   const view = presentBond(state)
-  assert.match(view.text, /尚未登录/)
-  assert.match(view.text, /需要先登录一次/)
+  // 🔴 文案绝不能写「请登录 / 重新登录」：桌面端没有账号登录入口
+  // （绑定即登录，见 bondVisibility 文档），用户会照着一个不存在的指引找按钮。
+  assert.doesNotMatch(view.text, /请登录|重新登录/)
+  assert.match(view.text, /自动恢复|无需手动登录/)
 })
 
 test('signed_in 非布尔（脏数据）：严格只认 true，一律按未登录处理', async () => {
@@ -231,29 +233,9 @@ test('user_label 为空白串：归一成 null 而不是留空显示', async () 
   assert.equal(state.userLabel, null)
 })
 
-/* ===== 登出（sign_out）：与解绑正交，额外要求已登录 ===== */
+/* ===== 登出能力已移除：绑定即登录，不存在「已登录想退出」 ===== */
 
-test('🔴 canSignOut 只在「已配对且已登录」时为 true', async () => {
-  const { presentBond } = await load()
-
-  // 已配对 + 已登录 → 可登出
-  assert.equal(
-    presentBond({ kind: 'paired', deviceId: 'd', online: true, signedIn: true, userLabel: 'a' })
-      .canSignOut,
-    true,
-  )
-  // 已配对 + 未登录 → 无从登出（旧服务端不签发会话时的常态）
-  assert.equal(
-    presentBond({ kind: 'paired', deviceId: 'd', online: true, signedIn: false, userLabel: null })
-      .canSignOut,
-    false,
-  )
-  // 未配对 / 读不出 → 一律不可
-  assert.equal(presentBond({ kind: 'unpaired' }).canSignOut, false)
-  assert.equal(presentBond({ kind: 'unknown', reason: 'x' }).canSignOut, false)
-})
-
-test('🔴 登出与解绑正交：已登录的已配对设备两者都可用', async () => {
+test('🔴 presentBond 不再有 canSignOut 字段（登出已随账号登录一并移除）', async () => {
   const { presentBond } = await load()
 
   const v = presentBond({
@@ -263,32 +245,27 @@ test('🔴 登出与解绑正交：已登录的已配对设备两者都可用', 
     signedIn: true,
     userLabel: 'alice',
   })
-  // 解绑只要求已配对；登出额外要求已登录。二者是**不同**的门禁，不能合并。
-  assert.equal(v.canUnpair, true, '解绑只要求已配对')
-  assert.equal(v.canSignOut, true, '登出额外要求已登录')
+  assert.equal('canSignOut' in v, false, 'Presentation 不该再有 canSignOut')
+  // 解绑仍然可用：它是唯一「彻底断开本机与账号」的动作。
+  assert.equal(v.canUnpair, true)
 })
 
-test('bondVisibility：showSignOut 由 signedIn 单独驱动，不能用 paired 推断', async () => {
+test('🔴 bondVisibility：showServerConfig 恒为真（配置随时可查可改）', async () => {
   const { bondVisibility } = await load()
 
-  // 已配对已登录 → 显示
-  assert.equal(
-    bondVisibility({ kind: 'paired', deviceId: 'd', online: true, signedIn: true, userLabel: null })
-      .showSignOut,
-    true,
-  )
-  // 已配对未登录 → 隐藏（若用 paired 推断就会错显一个永远点不动的按钮）
-  assert.equal(
-    bondVisibility({ kind: 'paired', deviceId: 'd', online: true, signedIn: false, userLabel: null })
-      .showSignOut,
-    false,
-  )
-  // 未配对 / 读不出 → 隐藏（fail-closed）
-  assert.equal(bondVisibility({ kind: 'unpaired' }).showSignOut, false)
-  assert.equal(bondVisibility({ kind: 'unknown', reason: 'x' }).showSignOut, false)
+  // 三种状态都必须能看/改服务端地址 —— 改造前它只在配对时出现一次，
+  // 配对成功后用户再也无法自证「我连的是哪台」，换 IP 只能解除配对。
+  for (const state of [
+    { kind: 'paired', deviceId: 'd', online: true, signedIn: true, userLabel: null },
+    { kind: 'paired', deviceId: 'd', online: false, signedIn: false, userLabel: null },
+    { kind: 'unpaired' },
+    { kind: 'unknown', reason: 'x' },
+  ]) {
+    assert.equal(bondVisibility(state).showServerConfig, true)
+  }
 })
 
-test('bondVisibility：配对表单与解绑互斥这条不变（登出不参与互斥）', async () => {
+test('bondVisibility：配对表单与解绑互斥这条不变', async () => {
   const { bondVisibility } = await load()
 
   const paired = bondVisibility({
@@ -298,10 +275,13 @@ test('bondVisibility：配对表单与解绑互斥这条不变（登出不参与
     signedIn: true,
     userLabel: null,
   })
-  // 已配对时：无配对表单、有解绑、有登出（三者共存是合法的 —— 登出与解绑正交）
+  // 已配对时：无配对表单、有解绑
   assert.equal(paired.showPairingForm, false)
   assert.equal(paired.showUnpair, true)
-  assert.equal(paired.showSignOut, true)
+
+  const unpaired = bondVisibility({ kind: 'unpaired' })
+  assert.equal(unpaired.showPairingForm, true)
+  assert.equal(unpaired.showUnpair, false)
 })
 
 /* ===== 会话失效（session_invalid）：设备令牌自续失败的呈现 ===== */
@@ -354,7 +334,6 @@ test('🔴 已配对 + 未登录 + session_invalid=expired：文案说明「过�
   assert.equal(view.tone, 'ok')
   // 绑定仍在：解绑入口必须依然可用（这正是「配对照旧有效」的语义）
   assert.equal(view.canUnpair, true)
-  assert.equal(view.canSignOut, false)
 })
 
 test('🔴 session_invalid=revoked：文案指向「重新配对」，色调转 warn', async () => {
@@ -406,9 +385,10 @@ test('未知的 session_invalid 取值：回落通用文案，绝不留空也绝
   const view = presentBond(state)
   assert.equal(state.sessionInvalid, 'brand_new_reason_from_future')
   assert.match(view.text, /会话已失效/)
-  // 通用文案必须是「可操作但不误导」：既提登录也提重新配对。
-  assert.match(view.text, /登录/)
-  assert.match(view.text, /配对/)
+  // 通用文案必须是「可操作但不误导」：指向自动恢复 + 重新配对两条真实路径。
+  // 🔴 不能提「登录」—— 桌面端界面上根本没有登录入口。
+  assert.match(view.text, /自动恢复|重新配对/)
+  assert.doesNotMatch(view.text, /请登录|重新登录/)
 })
 
 test('🔴 已登录时 session_invalid 不影响文案（会话好的，原因残留不该冒出来）', async () => {
