@@ -43,7 +43,9 @@ use std::time::Duration;
 
 use hd_protocol::envelope::{Envelope, MessageType};
 use hd_protocol::error_code;
-use hd_protocol::payload::{ErrorPayload, HelloPayload, TaskDispatchPayload, TaskProgressPayload};
+use hd_protocol::payload::{
+    ErrorPayload, FsListPayload, HelloPayload, TaskDispatchPayload, TaskProgressPayload,
+};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -61,6 +63,15 @@ use crate::transport::{Connection, TransportError};
 /// 等于「服务端一口气推 100 条派发 → 端侧起 100 个进程」把用户机器打爆。
 /// 4 是「桌面机从容、又不是串行白等」的经验值，可由构造器注入以便调节。
 pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
+
+/// `fs.*` 旁路帧的独立并发上限。
+///
+/// 🔴 **必须与 [`DEFAULT_MAX_CONCURRENCY`] 的任务并发池完全隔离**，不能复用同一个
+/// `Semaphore`。理由来自真实事故：长任务（`git clone` / `npm install`）会长时间占满
+/// 任务并发池，若目录浏览也去抢同一池的许可，用户点开目录选择器就会一直排队等到
+/// 服务端 3 秒超时 —— 表现为「桌面端空间一点就转圈」。而目录列举本身是毫秒级的
+/// 轻只读操作，给它一个独立小池（4）既不会打爆磁盘，也永远抢得到许可。
+pub const FS_FRAME_MAX_CONCURRENCY: usize = 4;
 
 /// 出站帧队列容量。
 ///
@@ -648,6 +659,8 @@ async fn session_loop<L: LiveLink>(
     let _keepalive_tx = out_tx.clone();
 
     let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
+    // 目录列举的独立轻量池：**绝不能**复用上面那个（长任务会把它占满）。
+    let fs_semaphore = Arc::new(Semaphore::new(FS_FRAME_MAX_CONCURRENCY));
     let mut tasks: JoinSet<()> = JoinSet::new();
 
     loop {
@@ -707,7 +720,14 @@ async fn session_loop<L: LiveLink>(
                         last_rx = Instant::now();
                         // 单帧处理抽成独立函数：既要让 session_loop 保持线性可读，
                         // 也为了让「一帧进来会发生什么」可以在不跑时钟循环的情况下测。
-                        match handle_frame(env, router, &out_tx, &semaphore, &mut tasks) {
+                        match handle_frame(
+                            env,
+                            router,
+                            &out_tx,
+                            &semaphore,
+                            &fs_semaphore,
+                            &mut tasks,
+                        ) {
                             FrameAction::Continue => {}
                             FrameAction::Close(err) => {
                                 // 等未完成的任务把终态写进队列，再尽量发出去一点点，
@@ -734,9 +754,16 @@ enum FrameAction {
 
 /// 处理一帧（**同步**，不 `await`）。
 ///
-/// 之所以能是同步的：接上出站队列之后，处理一帧只剩下「解码 + 把活派给任务」，
-/// 不再需要就地写连接。这让 `session_loop` 的 select 干净很多 —— 一个会
-/// `.await` 的帧处理函数会让读帧分支持有 `&mut link` 的同时去等任务完成。
+/// ## 结构：纯委派
+///
+/// 本函数现在只做三件事：
+/// 1. **解码**（`env.decode::<T>()`）；
+/// 2. **委派**到 [`crate::frames`] 对应的帧处理器（业务语义全在那里，可独立单测）；
+/// 3. **归一化**结果（`FrameOutcome` → [`FrameAction`]）。
+///
+/// 任何业务逻辑（怎么执行、怎么回帧、错误码怎么映射）都**不许**再内联到这里：
+/// 本函数处在心跳/重连的中枢循环上，改一次就要重新论证连接存活性，成本极高 ——
+/// 这正是 `fs.list` 被拖到最后才实现的原因之一。
 ///
 /// `router` 为 `None` 时，任务派发帧被静默忽略——这正是本文件接入 router 之前的
 /// 行为，因此所有既有的心跳/重连测试无需改动即可继续通过。
@@ -745,6 +772,7 @@ fn handle_frame(
     router: Option<&Arc<Router>>,
     out_tx: &mpsc::Sender<Envelope>,
     semaphore: &Arc<Semaphore>,
+    fs_semaphore: &Arc<Semaphore>,
     tasks: &mut JoinSet<()>,
 ) -> FrameAction {
     match env.msg_type {
@@ -791,9 +819,117 @@ fn handle_frame(
             }
             FrameAction::Continue
         }
-        // 其余帧（pong / welcome / 租约等）当前不参与判定
-        _ => FrameAction::Continue,
+        // ============ 目录列举（L1 旁路查询）============
+        //
+        // 🔴 三条约束，逐条都有对应测试：
+        // 1. **独立信号量** `fs_semaphore`，与任务池隔离（长任务不得堵住目录浏览）；
+        // 2. **经 `tasks` 派发**，绝不阻塞读帧循环（列举要碰磁盘，可能几十毫秒）；
+        // 3. **失败也回帧**（含「未挂 router」），绝不静默 —— 静默会让服务端
+        //    只能干等 3 秒超时，这正是本次事故的形态。
+        MessageType::FsList => {
+            let req_id = env.id.clone();
+            // 负载非法是**服务端**的问题：回 bad_frame 快速失败，不断连。
+            let payload = match env.decode::<FsListPayload>() {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    warn!(req_id = %req_id, "fs.list 无负载，回 bad_frame");
+                    spawn_reply(
+                        tasks,
+                        out_tx.clone(),
+                        crate::frames::error_envelope(
+                            &req_id,
+                            error_code::FRAME_BAD_FRAME,
+                            "fs.list 缺少负载",
+                        ),
+                    );
+                    return FrameAction::Continue;
+                }
+                Err(e) => {
+                    warn!(error = %e, req_id = %req_id, "fs.list 负载解码失败，回 bad_frame");
+                    spawn_reply(
+                        tasks,
+                        out_tx.clone(),
+                        crate::frames::error_envelope(
+                            &req_id,
+                            error_code::FRAME_BAD_FRAME,
+                            "fs.list 负载解码失败",
+                        ),
+                    );
+                    return FrameAction::Continue;
+                }
+            };
+
+            // router 是 `Option<Arc<Router>>` 的共享引用：克隆 Arc 让它进任务。
+            let router_owned = router.map(Arc::clone);
+            let tx = out_tx.clone();
+            let permit_pool = Arc::clone(fs_semaphore);
+            tasks.spawn(async move {
+                let Ok(_permit) = permit_pool.acquire_owned().await else {
+                    return;
+                };
+                let outcome = crate::frames::fs_list::handle_fs_list(
+                    router_owned.as_ref(),
+                    &env,
+                    &payload,
+                    &tx,
+                )
+                .await;
+                if !outcome.is_replied() {
+                    debug!(req_id = %env.id, "目录列举未回帧（出站队列已关闭）");
+                }
+            });
+            FrameAction::Continue
+        }
+        // 其余帧（pong / welcome / 租约 / fs.list.result 等）当前不参与判定
+        MessageType::Pong
+        | MessageType::Welcome
+        | MessageType::Hello
+        | MessageType::Ping
+        | MessageType::LeaseRevoked
+        | MessageType::FsListResult
+        | MessageType::TaskProgress
+        | MessageType::TaskResult => FrameAction::Continue,
+        // ============ 未知帧：快速失败优于 3 秒长等待 ============
+        //
+        // 改造前这里是 `_ => FrameAction::Continue`（静默丢弃）。本次 `fs.list` 事故的
+        // 根因就在这个分支：服务端早就实现了派发，端侧版本还没实现对应的 `MessageType`
+        // 变体，于是帧被 `#[serde(other)] Unknown` 兜底后**静默丢掉** —— 服务端只能
+        // 干等 3 秒硬超时，用户看到的是「目录选择器永久转圈」，日志里一片安静。
+        //
+        // 现在改为：warn 留痕 + 回一条 `device.bad_frame`。好处有三：
+        // 1. 服务端**立刻**拿到可归因的错误码，不必等满 3 秒；
+        // 2. 排障时日志里能直接看到「哪条帧端侧不认识」；
+        // 3. 仍然不断连 —— 未知帧不代表连接坏了（服务端可能只是新版本）。
+        MessageType::Unknown => {
+            warn!(
+                msg_type = ?env.msg_type,
+                req_id = %env.id,
+                "收到未知帧类型：回 device.bad_frame 快速失败（不再静默丢弃）"
+            );
+            spawn_reply(
+                tasks,
+                out_tx.clone(),
+                crate::frames::error_envelope(
+                    &env.id,
+                    error_code::FRAME_BAD_FRAME,
+                    "端侧不支持该帧类型（可能客户端版本过旧）",
+                ),
+            );
+            FrameAction::Continue
+        }
     }
+}
+
+/// 把一条**预先构造好的**帧经独立任务排入出站队列。
+///
+/// 抽出来是为了让「快速失败」分支不阻塞读帧循环：`mpsc::send` 在队列满时会 `await`，
+/// 而读帧分支持有 session_loop 的控制权，就地 await 会让心跳被饿住。
+fn spawn_reply(tasks: &mut JoinSet<()>, tx: mpsc::Sender<Envelope>, env: Envelope) {
+    tasks.spawn(async move {
+        if tx.send(env).await.is_err() {
+            debug!("快速失败帧未送出：出站队列已关闭");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1402,5 +1538,91 @@ mod tests {
         assert_eq!(*calls.lock().expect("不应有锁竞争"), 0);
         assert!(outbox.lock().expect("不应有锁竞争").is_empty());
         assert!(obs.stop_reason().is_none());
+    }
+
+    /// 造一条 `fs.list` 帧（path 为空 = 只回 roots）。
+    fn fs_list_envelope(req_id: &str, path: &str) -> Envelope {
+        Envelope::new(
+            MessageType::FsList,
+            req_id,
+            Some(serde_json::json!({ "path": path, "with_roots": path.is_empty() })),
+        )
+    }
+
+    /// 🔴 本次事故的主链路回归：`fs.list` 帧进来必须真的回一条 `fs.list.result`。
+    ///
+    /// 改造前端侧没有 `MessageType::FsList`，帧被归入 `Unknown` 后静默丢弃，
+    /// 服务端只能干等 3 秒超时 —— 表现为 web 端目录选择器永久转圈。
+    /// 本测试跑真实 `session_loop`（读帧 → 派发到 JoinSet → 单写者出站），
+    /// 断言应答类型、id 配对、payload 形状，并断言**没有**产生任务回执（不走任务链路）。
+    #[tokio::test]
+    async fn fs_list_frame_is_answered_with_result_and_not_via_task_pipeline() {
+        let mut connector = scripted(vec![Ok(HeartbeatPolicy::from_welcome(1, 10))]);
+        let root = std::env::current_dir().expect("cwd");
+        let root_str = root.to_string_lossy().into_owned();
+        connector
+            .frames
+            .push_back(VecDeque::from([Ok(Some(fs_list_envelope(
+                "fsq-e2e", &root_str,
+            )))]));
+        let outbox = Arc::clone(&connector.outbox);
+        let calls = Arc::new(Mutex::new(0usize));
+        let mut sup = Supervisor::with_sleeper(connector, ReconnectPolicy::default(), NoopSleeper)
+            .with_router(test_router(Arc::clone(&calls)));
+        let mut obs = CollectingObserver::default();
+
+        let timed_out = tokio::time::timeout(Duration::from_secs(2), sup.run(&mut obs))
+            .await
+            .is_err();
+        assert!(timed_out, "回完应答应继续在线，而不是退出");
+
+        let sent = outbox.lock().expect("不应有锁竞争").clone();
+        assert_eq!(sent.len(), 1, "必须回一帧，实际 {sent:?}");
+        assert_eq!(sent[0].msg_type, MessageType::FsListResult);
+        assert_eq!(sent[0].id, "fsq-e2e", "信封 id 必须逐字回显请求 id");
+        let p: hd_protocol::payload::FsListResultPayload = sent[0]
+            .decode()
+            .expect("负载应可解码")
+            .expect("fs.list.result 必须有负载");
+        assert!(p.error.is_empty(), "列举当前目录应成功：{p:?}");
+        assert_eq!(p.path, root_str);
+        assert_eq!(p.separator, hd_core::executor::fs::separator());
+        // 🔴 目录浏览不产生任务回执、不执行 executor
+        assert_eq!(
+            *calls.lock().expect("不应有锁竞争"),
+            0,
+            "目录浏览不得走 Router::dispatch"
+        );
+    }
+
+    /// 未知帧现在会**回 bad_frame 快速失败**，不再静默丢弃（3 秒长等待的根因）。
+    #[tokio::test]
+    async fn unknown_frame_replies_bad_frame_instead_of_silence() {
+        let mut connector = scripted(vec![Ok(HeartbeatPolicy::from_welcome(1, 10))]);
+        connector
+            .frames
+            .push_back(VecDeque::from([Ok(Some(Envelope::new(
+                // 服务端新增、本端未实现的帧
+                serde_json::from_str::<MessageType>("\"fs.watch\"").expect("应为 Unknown"),
+                "f-unknown",
+                Some(serde_json::json!({ "path": "/" })),
+            )))]));
+        let outbox = Arc::clone(&connector.outbox);
+        let mut sup = Supervisor::with_sleeper(connector, ReconnectPolicy::default(), NoopSleeper);
+        let mut obs = CollectingObserver::default();
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(300), sup.run(&mut obs))
+            .await
+            .is_err();
+        assert!(timed_out, "未知帧不得导致断连");
+
+        let sent = outbox.lock().expect("不应有锁竞争").clone();
+        assert_eq!(sent.len(), 1, "未知帧必须回一帧，实际 {sent:?}");
+        assert_eq!(sent[0].msg_type, MessageType::Error);
+        assert_eq!(sent[0].id, "f-unknown");
+        let p: hd_protocol::payload::ErrorPayload =
+            sent[0].decode().expect("解码").expect("错误帧必有负载");
+        assert_eq!(p.code, error_code::FRAME_BAD_FRAME);
+        assert!(!p.fatal, "帧级错误不得断连");
     }
 }

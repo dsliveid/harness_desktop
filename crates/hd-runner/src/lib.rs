@@ -13,6 +13,7 @@
 
 pub mod capabilities;
 pub mod cli;
+pub mod frames;
 pub mod heartbeat;
 pub mod idempot;
 pub mod ipc;
@@ -24,6 +25,7 @@ pub mod transport;
 
 pub use capabilities::{capabilities_hash, capabilities_of, snapshot as capabilities_snapshot};
 pub use cli::{run_cli, EXIT_NO_AUTH};
+pub use frames::{error_envelope, fs_list_result_envelope, FrameOutcome};
 pub use heartbeat::HeartbeatPolicy;
 pub use idempot::{
     ClaimGuard, ClaimResult, Clock, IdempotStore, SystemClock, DEFAULT_CAPACITY, DEFAULT_TTL,
@@ -35,5 +37,6 @@ pub use router::{CollectingSink, Router, CODE_DEVICE_TIMEOUT, STATUS_FAILED, STA
 pub use supervisor::{
     Connector, LiveLink, NoopObserver, NoopSleeper, Sleeper, StopReason, Supervisor,
     SupervisorEvent, SupervisorObserver, TokioSleeper, WsConnector, DEFAULT_MAX_CONCURRENCY,
+    FS_FRAME_MAX_CONCURRENCY,
 };
 pub use transport::{Connection, Session, TransportError};

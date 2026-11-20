@@ -43,6 +43,14 @@ pub enum MessageType {
     /// 服→端：会话租约被抢占。
     #[serde(rename = "lease.revoked")]
     LeaseRevoked,
+    /// 服→端：目录列举请求（L1，工作区目录选择器）。
+    ///
+    /// 🔴 **不是任务帧**：见 [`MessageType::is_task_frame`] 的类型级说明。
+    #[serde(rename = "fs.list")]
+    FsList,
+    /// 端→服：目录列举结果（L1）。信封 `id` 必须逐字回显请求的 `id`。
+    #[serde(rename = "fs.list.result")]
+    FsListResult,
     /// 未知帧类型（服务端新增、本端未实现）。调用方应静默丢弃。
     #[serde(other)]
     Unknown,
@@ -50,6 +58,12 @@ pub enum MessageType {
 
 impl MessageType {
     /// 是否为任务派发族（供路由分流）。
+    ///
+    /// 🔴 `FsList` / `FsListResult` **必须永远不在此列**。这是一条**类型级**保证：
+    /// 目录浏览（工作区目录选择器）是 L1 旁路查询，不产生 `tool_event`、不落库、
+    /// 不进幂等缓存、不参与任务并发池。历史事故：端侧把 `fs.list` 当未知帧静默丢弃，
+    /// web 端每次打开目录选择器都要空等 3 秒超时。若把它们加进本判定，就会出现
+    /// 「点一下目录 = 生成一条工具事件」的语义污染，故此处刻意排除并在测试里锁死。
     pub fn is_task_frame(&self) -> bool {
         matches!(
             self,
@@ -74,6 +88,8 @@ impl MessageType {
             MessageType::TaskProgress => "task.progress",
             MessageType::TaskResult => "task.result",
             MessageType::LeaseRevoked => "lease.revoked",
+            MessageType::FsList => "fs.list",
+            MessageType::FsListResult => "fs.list.result",
             MessageType::Unknown => "",
         }
     }

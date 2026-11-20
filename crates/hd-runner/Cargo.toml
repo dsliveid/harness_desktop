@@ -22,6 +22,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hd-testkit = { path = "../hd-testkit" }
 # 只在测试里手写假 Executor 需要它（生产代码从不 `impl Executor`，故不进依赖区）。
 async-trait = "0.1"
+# 目录列举单测需要真实临时目录树（`frames/fs_list.rs`）。
+tempfile = "3"
 
 # ## 为什么本 crate 现在**只有 lib，没有 [[bin]]**
 #

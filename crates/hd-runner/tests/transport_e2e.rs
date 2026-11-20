@@ -134,8 +134,12 @@ async fn ping_echoes_the_capabilities_hash_from_hello() {
         500,
     ));
     let (caps, caps_hash) = hd_runner::capabilities_snapshot(&router);
-    assert_eq!(caps.len(), 1, "应申报 fs.list");
-    assert_eq!(caps[0].name, "fs.list");
+    assert_eq!(caps.len(), 1, "应申报 workspace.list（工具名 fs.list）");
+    assert_eq!(
+        caps[0].name,
+        hd_protocol::capability::WORKSPACE_LIST,
+        "申报名必须是服务端词汇 workspace.list，不是工具名 fs.list"
+    );
 
     let hello = HelloPayload {
         name: "测试 Runner".into(),

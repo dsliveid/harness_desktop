@@ -36,6 +36,15 @@ use crate::router::Router;
 ///
 /// 未列入的工具（如将来可能出现的 `fs.read` / `process`）**不会**出现在能力清单里：
 /// 对外通报即等于向服务端与日志暴露本机可执行面，需要单独评审后再加。
+///
+/// ## 两个条件必须同时满足（白名单 × 映射表）
+///
+/// 这里用**工具名**（`fs.list`）过滤，输出的 `name` 用**能力名**（`workspace.list`），
+/// 后者由 [`hd_protocol::capability::capability_for_tool`] 派生 —— 「能力申报的唯一
+/// 真相源」在协议层，`pairing.rs` 的配对申报与本文件共用同一份映射。
+/// 两道条件缺一不可：
+/// - 只在本白名单、不在映射表 → 无法得出对外能力名 → 跳过（防自造词汇）；
+/// - 只在映射表、不在本白名单 → 不申报（保留既有「显式加一行」的评审语义）。
 const EXPOSED_TOOLS: &[&str] = &["fs.list"];
 
 /// 所有对外能力的版本号。
@@ -55,17 +64,26 @@ const HASH_PREFIX: &str = "fnv1a64:";
 /// 输出按 `name` 升序（稳定顺序便于断言与日志比对）；`device_id` 留空
 /// （端侧上报时不知道自己的服务端分配 ID），`updated_at` 固定 0
 /// （与 Go 侧 `omitempty` 缺失语义一致）。
+///
+/// 🔴 `name` **不许**直接取工具名：服务端的能力词汇表用 `workspace.*` 命名空间
+/// （`pkg/toolapi/spec.go`），端侧工具名用 `fs.*`。二者由
+/// [`hd_protocol::capability::capability_for_tool`] 映射，此前 `pairing.rs` 手写
+/// `"workspace.list"` 而本文件输出 `"fs.list"` —— 两处字面量分叉会让服务端
+/// 看到「申报了但派发不了」或反之，是本次事故的同源病灶。
 pub fn capabilities_of(router: &Router) -> Vec<Capability> {
     let mut caps: Vec<Capability> = router
         .tool_names()
         .into_iter()
         // 🔴 白名单过滤：Router 里有的 ≠ 对外通报的。
         .filter(|name| EXPOSED_TOOLS.contains(name))
-        .map(|name| Capability {
-            device_id: String::new(),
-            name: name.to_string(),
-            version: CAPABILITY_VERSION.to_string(),
-            updated_at: 0,
+        // 🔴 能力名经协议层映射派生；表外工具即使注册也不申报。
+        .filter_map(|tool| {
+            hd_protocol::capability::capability_for_tool(tool).map(|capability| Capability {
+                device_id: String::new(),
+                name: capability.to_string(),
+                version: CAPABILITY_VERSION.to_string(),
+                updated_at: 0,
+            })
         })
         .collect();
     caps.sort_by(|a, b| a.name.cmp(&b.name));
@@ -180,8 +198,12 @@ mod tests {
         ));
 
         let caps = capabilities_of(&router);
-        assert_eq!(caps.len(), 1, "默认只应申报 fs.list，实际 {caps:?}");
-        assert_eq!(caps[0].name, "fs.list");
+        assert_eq!(caps.len(), 1, "默认只应申报一项，实际 {caps:?}");
+        assert_eq!(
+            caps[0].name,
+            hd_protocol::capability::WORKSPACE_LIST,
+            "工具名 fs.list 必须申报为服务端能力词汇 workspace.list"
+        );
         assert_eq!(caps[0].version, CAPABILITY_VERSION);
         assert!(caps[0].device_id.is_empty(), "端侧上报不带 device_id");
         assert_eq!(caps[0].updated_at, 0);
@@ -211,7 +233,11 @@ mod tests {
         router.register(NamedTool("fs.list"));
         let caps = capabilities_of(&router);
         assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0].name, "fs.list");
+        assert_eq!(
+            caps[0].name,
+            hd_protocol::capability::WORKSPACE_LIST,
+            "申报名必须是服务端词汇 workspace.list，不是工具名 fs.list"
+        );
     }
 
     #[test]

@@ -46,7 +46,11 @@ fn hello_decodes_from_go_fixture() {
     assert_eq!(p.capabilities.len(), 3);
     // 🔴 能力名必须是 pkg/toolapi 的合法常量词汇，不得自造
     assert_eq!(p.capabilities[0].name, "workspace.read");
-    assert_eq!(p.capabilities[1].name, "workspace.list");
+    assert_eq!(
+        p.capabilities[1].name,
+        hd_protocol::capability::WORKSPACE_LIST,
+        "端侧申报的能力名必须与协议层唯一真相源一致（hd-runner 的申报也经同一映射派生）"
+    );
     // updated_at 无 omitempty，Go 固定输出 0
     assert_eq!(p.capabilities[0].updated_at, 0);
 }
@@ -199,8 +203,12 @@ fn envelope_roundtrip_preserves_shape() {
 
 #[test]
 fn unknown_frame_type_is_dropped_not_fatal() {
-    // 模拟「服务端新增了 fs.* 帧，而本端壳较旧」的场景
-    let raw = r#"{"v":1,"type":"fs.list","id":"x","ts":1,"payload":{"path":"/"}}"#;
+    // 模拟「服务端新增了本端尚未实现的帧，而本端壳较旧」的场景。
+    //
+    // ⚠️ 这里**不能**再用 `fs.list` —— 它自本次改造起已是已知帧
+    // （见 `tests/fs_list_golden.rs`）。用 `fs.list` 做「未知帧」样本会让这条
+    // 向后兼容测试在协议补全后变成永远红/永远假的哑测试。
+    let raw = r#"{"v":1,"type":"fs.watch","id":"x","ts":1,"payload":{"path":"/"}}"#;
     let env: Envelope = serde_json::from_str(raw).expect("未知类型也必须可解析，否则会断连");
     assert_eq!(env.msg_type, MessageType::Unknown);
     assert!(!env.msg_type.is_valid());

@@ -17,7 +17,7 @@
 pub mod executor;
 pub mod security;
 
-pub use executor::fs::{DirEntry, DirListing, ListDirsExecutor, FS_MAX_DIRS};
+pub use executor::fs::{list_dirs, DirEntry, DirListing, ListDirsExecutor, FS_MAX_DIRS};
 pub use executor::{
     ExecCtx, ExecError, ExecOutput, Executor, Limits, NoopSink, ProgressSink, SourceTrust,
 };

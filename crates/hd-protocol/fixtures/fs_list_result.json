@@ -1,0 +1,20 @@
+{
+  "v": 1,
+  "type": "fs.list.result",
+  "id": "fsq-1704067200000000000-1",
+  "ts": 1704067200123,
+  "payload": {
+    "path": "C:\\Users\\me\\work",
+    "parent": "C:\\Users\\me",
+    "separator": "\\",
+    "roots": [
+      { "name": "work", "path": "C:\\Users\\me\\work" },
+      { "name": "tmp", "path": "C:\\Users\\me\\tmp" }
+    ],
+    "dirs": [
+      { "name": "Proj", "path": "C:\\Users\\me\\work\\Proj" },
+      { "name": "Docs", "path": "C:\\Users\\me\\work\\Docs" }
+    ],
+    "truncated": false
+  }
+}

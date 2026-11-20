@@ -204,3 +204,83 @@ pub struct LeaseRevokedPayload {
     #[serde(default)]
     pub reason: String,
 }
+
+// ============ fs.* 目录列举族（L1 旁路查询，非任务帧） ============
+//
+// 对齐 `protocol.go:243-282`（`FsListPayload` / `FsDirEntry` / `FsListResultPayload`）
+// 与 `docs/工作区宿主与目录选择对接约定.md` §3.3。
+//
+// 🔴 三条铁律（均来自真实事故）：
+// 1. **不是任务帧**：不产生 `tool_event`、不进幂等缓存、不占任务并发池；
+// 2. **`id` 只在信封上配对**：应答的 `env.id` 逐字等于请求的 `env.id`，payload 内无 id 字段；
+// 3. **`DirEntry` 只有 `name` + `path`**：多一个元数据字段就会诱使前端把「浏览」
+//    升级成「枚举」。
+
+/// 目录列举请求（服→端），对齐 `FsListPayload`。
+///
+/// `path` 为空串表示「未定位」：端侧只回 `roots`（盘符/挂载点/白名单根），
+/// 让用户从根开始浏览。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsListPayload {
+    /// 目标目录绝对路径；空串 = 未定位（只回 roots）。
+    #[serde(default)]
+    pub path: String,
+    /// 是否附带 roots（Go 侧 `omitempty`）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub with_roots: bool,
+}
+
+/// 一个目录项，对齐 `FsDirEntry`。
+///
+/// 🔴 **只允许 `name` 与 `path`**：这是目录选择器，不是文件浏览器。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsDirEntry {
+    /// 显示名（盘根没有 file_name 时退化为全路径）。
+    #[serde(default)]
+    pub name: String,
+    /// 绝对路径（宿主本机口径）。
+    #[serde(default)]
+    pub path: String,
+}
+
+/// 目录列举结果（端→服），对齐 `FsListResultPayload`。
+///
+/// 字段与 web 端 `DirListing`、桌面端 `hd_core::DirListing` 逐字对齐（`hd-core` 的
+/// 本地 `host` 字段**刻意不带上行**：服务端已从连接上下文知道设备身份，
+/// 多带字段会被服务端拒绝/丢弃）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsListResultPayload {
+    /// 当前目录绝对路径；空串 = 未定位（此时只有 roots）。
+    #[serde(default)]
+    pub path: String,
+    /// 上级目录；`null` = 已在白名单根层级（**绝不返回 `".."`**）。
+    ///
+    /// 🔴 无 `skip_serializing_if`：Go 侧 `Parent *string` 无 omitempty，
+    /// `null` 必须显式出现在线上，否则前端无法区分「根层级」与「缺字段」。
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// 宿主路径分隔符（Windows `\`，POSIX `/`），前端据此切面包屑。
+    #[serde(default)]
+    pub separator: String,
+    /// 可选根（仅在 `path` 为空时给出）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<FsDirEntry>,
+    /// 子目录（**只含目录，永不含文件**）。
+    #[serde(default)]
+    pub dirs: Vec<FsDirEntry>,
+    /// 目录项过多被截断。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// 端侧拒绝/失败原因（非空表示本次列举失败）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    /// 端侧错误码（`fs.path_denied` / `fs.path_not_found` / `fs.host_timeout` 等），
+    /// 服务端据此映射 `apperr`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+}
+
+/// `skip_serializing_if` 需要的「为假」判定（Go 侧 `omitempty` 语义）。
+fn is_false(v: &bool) -> bool {
+    !*v
+}

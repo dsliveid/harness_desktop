@@ -15,11 +15,13 @@
 //! 与 Go 侧同规格：**只允许新增字段**，禁止删除/改名/改类型。所有 payload 字段都带
 //! `#[serde(default)]`，保证「旧服务端缺字段」与「新服务端多字段」双向可解析。
 
+pub mod capability;
 pub mod envelope;
 pub mod error_code;
 pub mod exit_code;
 pub mod payload;
 
+pub use capability::{capability_for_tool, WORKSPACE_LIST};
 pub use envelope::{
     compatible_version, supported_versions, Envelope, MessageType, ProtocolError,
     CURRENT_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
@@ -29,6 +31,7 @@ pub use exit_code::{
     EXIT_OK, EXIT_PROTOCOL_MISMATCH, EXIT_REPLACED, EXIT_RETRYABLE, EXIT_REVOKED,
 };
 pub use payload::{
-    Capability, ErrorPayload, HelloPayload, LeaseRevokedPayload, PingPayload, PongPayload,
-    SourceTrust, TaskDispatchPayload, TaskProgressPayload, TaskResultPayload, WelcomePayload,
+    Capability, ErrorPayload, FsDirEntry, FsListPayload, FsListResultPayload, HelloPayload,
+    LeaseRevokedPayload, PingPayload, PongPayload, SourceTrust, TaskDispatchPayload,
+    TaskProgressPayload, TaskResultPayload, WelcomePayload,
 };
