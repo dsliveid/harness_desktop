@@ -22,3 +22,4 @@ pub use executor::{
     ExecCtx, ExecError, ExecOutput, Executor, Limits, NoopSink, ProgressSink, SourceTrust,
 };
 pub use security::guard::{AuditEvent, AuditOutcome, AuditSink, Guarded, NullAuditSink, Policy};
+pub use security::roots::default_roots;

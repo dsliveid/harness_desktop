@@ -630,6 +630,23 @@ impl HostState {
         user_vault: Arc<dyn UserTokenVault>,
         stats: Arc<RuntimeStats>,
     ) -> Self {
+        // 初始工作区根 = **整机盘符**（与服务端 `fsAllowedRoots` 口径同源，2026-11 修正）。
+        //
+        // ## 为什么不能留空
+        //
+        // 旧的初始值是空白名单，于是 Runner 只认自己启动时的 CWD（= exe 所在目录），
+        // web 目录选择器里选设备宿主只能看到程序包所在目录，无法浏览整台机器。
+        // 这里一开始就给整机根，让三条路径同源：
+        //   ① `get_workspace_roots` 给前端设置面板的初值；
+        //   ② Runner 重启后 `current_policy()` 重放快照（不再静默退回 CWD）；
+        //   ③ `fs.list` 的端侧白名单。
+        //
+        // ## 为什么 roots 取自 policy.roots()
+        //
+        // `Policy::new` 会 canonicalize 并剥掉 Windows 的 `\\?\` 前缀。若这里另存一份
+        // 原始输入，就会出现「设置面板显示的路径」与 `fs.list` 返回的面包屑不一致。
+        let initial_policy = Policy::new(hd_core::default_roots(), Vec::new());
+        let initial_roots = initial_policy.roots().to_vec();
         Self {
             vault,
             user_vault,
@@ -641,8 +658,8 @@ impl HostState {
             // 默认建一个实例：单测与旧调用方无需改动。
             // 生产路径（gui.rs）会用 `with_daemon` 注入同一个实例。
             daemon: Arc::new(Daemon::new(hd_runner::reconnect::ReconnectPolicy::default())),
-            roots: RwLock::new(Vec::new()),
-            policy: RwLock::new(Arc::new(Policy::new(Vec::new(), Vec::new()))),
+            roots: RwLock::new(initial_roots),
+            policy: RwLock::new(Arc::new(initial_policy)),
             device_id: RwLock::new(None),
             // 未握手前没有「协议不通过」的事实，默认 true 避免前端误报红。
             protocol_ok: RwLock::new(true),
@@ -1974,7 +1991,8 @@ pub fn set_workspace_roots(
 /// ## 为什么必须存在（改造前缺的就是这一步）
 ///
 /// [`set_workspace_roots`] 只写 `HostState`。Runner 侧的 `Policy` 来自它自己启动时的
-/// `initial_roots()`（= 进程当前目录），此后只有收到 `reload_policy` 控制行才会更新。
+/// `initial_roots()`（= **整机盘符**，见 `hd_core::default_roots`），此后只有收到
+/// `reload_policy` 控制行才会更新。
 /// 那条控制行在改造前**从未被发出**，于是：
 ///
 /// ```text
@@ -2484,9 +2502,19 @@ mod tests {
     }
 
     #[test]
-    fn workspace_roots_start_empty_and_set_normalizes() {
+    fn workspace_roots_start_at_machine_scope_and_set_normalizes() {
         let st = state();
-        assert!(get_workspace_roots(&st).is_empty());
+        // 初始即「整机」口径（与服务端 fsAllowedRoots 同源），不是空白名单：
+        // 空白名单会让 Runner 只认自己的 CWD（= exe 目录），正是本轮修掉的缺陷。
+        let initial = get_workspace_roots(&st);
+        assert!(!initial.is_empty(), "初始工作区根不该为空（应为整机盘符）");
+        let policy_view: Vec<String> = st
+            .policy()
+            .roots()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(initial, policy_view, "设置面板初值与 policy 快照必须同源");
 
         let dir = tempfile::tempdir().unwrap();
         let raw = dir.path().display().to_string();
@@ -2506,6 +2534,8 @@ mod tests {
     #[test]
     fn set_workspace_roots_rejects_empty_and_bad_paths() {
         let st = state();
+        // 「不改变既有配置」的基准值是**初始整机根**（不再是空）。
+        let before = get_workspace_roots(&st);
         assert!(matches!(
             set_workspace_roots(&st, vec![]),
             Err(CommandError::EmptyRoots)
@@ -2524,7 +2554,11 @@ mod tests {
             Err(CommandError::NotADirectory(_))
         ));
         // 失败不改变既有配置（不留下半套策略）。
-        assert!(get_workspace_roots(&st).is_empty());
+        assert_eq!(
+            get_workspace_roots(&st),
+            before,
+            "校验失败不该改动既有白名单"
+        );
     }
 
     #[test]
@@ -2643,20 +2677,19 @@ mod tests {
     #[tokio::test]
     async fn push_path_rejects_empty_before_any_push() {
         let st = state();
+        let before = get_workspace_roots(&st);
         let err = set_workspace_roots_and_push(&st, Vec::new())
             .await
             .expect_err("空白名单必须拒绝");
         assert!(matches!(err, CommandError::EmptyRoots), "实际 {err:?}");
-        assert!(
-            get_workspace_roots(&st).is_empty(),
-            "校验失败不应改动宿主状态"
-        );
+        assert_eq!(get_workspace_roots(&st), before, "校验失败不应改动宿主状态");
     }
 
     /// 校验类错误（不是目录）同样必须保持 `Err`：这条钉住「三态化没有把真错误也吞掉」。
     #[tokio::test]
     async fn push_path_keeps_validation_errors_as_err() {
         let st = state();
+        let before = get_workspace_roots(&st);
         let dir = tempfile::tempdir().unwrap();
         let not_a_dir = dir.path().join("a.txt");
         std::fs::write(&not_a_dir, b"x").unwrap();
@@ -2668,10 +2701,7 @@ mod tests {
             matches!(err, CommandError::NotADirectory(_)),
             "实际 {err:?}"
         );
-        assert!(
-            get_workspace_roots(&st).is_empty(),
-            "校验失败不该留下半套配置"
-        );
+        assert_eq!(get_workspace_roots(&st), before, "校验失败不该留下半套配置");
     }
 
     // ===== P3 三态：pushed 判定的穷举覆盖 =====

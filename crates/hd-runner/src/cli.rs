@@ -214,7 +214,7 @@ async fn run_async(dev_mode: bool) -> u8 {
         router
     };
 
-    // 初始白名单根：进程当前目录（保证开箱可用），后续由宿主经 `reload_policy` 精确下发。
+    // 初始白名单根：整机盘符（与服务端口径同源），后续由宿主经 `reload_policy` 精确下发。
     let initial_roots = initial_roots();
     let router = std::sync::Arc::new(build_router(initial_roots));
 
@@ -290,12 +290,30 @@ async fn run_async(dev_mode: bool) -> u8 {
     }
 }
 
-/// 初始白名单根：当前工作目录。
+/// 初始白名单根：**整机文件系统根**（Windows 各逻辑盘符 / POSIX `/`）。
 ///
-/// 为什么不用用户主目录：Windows 上主目录可能极大，而 Runner 启动时通常已经
-/// 在工作区内（由宿主以工作区为 cwd 拉起）。给一个「够用且不会误放大范围」的默认。
-/// 宿主的 `reload_policy` 会很快把它替换成精确白名单。
+/// ## 为什么不再用「进程当前目录」（2026-11 口径修正）
+///
+/// 旧实现返回 `current_dir()`，Windows 双击启动时它 ≈ exe 所在目录，于是端侧
+/// `fs.list` 只能列那一层的子目录、面包屑也无法上跳 —— web 目录选择器里表现为
+/// 「桌面端只能选程序包所在目录」，而 `host=server` 却能浏览整台机器。
+/// 两端口径必须同源：服务端默认可浏览整机（`internal/api/fs_handler.go` +
+/// `cmd/harness-go/fsroots_*.go`），端侧就此对齐，见 [`hd_core::default_roots`]。
+///
+/// ## fail-closed 兜底为什么不返回空
+///
+/// 空白名单意味着「拒绝一切」（`Policy::check_path` 的 fail-closed 分支）：
+/// 极端受限环境下整机枚举失败时，返回空会让 Runner 连自己的启动目录都读不了，
+/// 用户看到的是「设备在线但任何目录都打不开」。宁可回落到旧的 CWD 行为保住可用性
+/// —— 那仍是**收敛**的范围，不比整机更宽。
+///
+/// 宿主的 `reload_policy` 会在启动后很快用用户配置的精确白名单覆盖它。
 fn initial_roots() -> Vec<std::path::PathBuf> {
+    let machine = hd_core::default_roots();
+    if !machine.is_empty() {
+        return machine;
+    }
+    tracing::warn!("整机目录枚举失败（极少数受限环境），回退为进程当前目录作为初始白名单");
     std::env::current_dir().map(|p| vec![p]).unwrap_or_default()
 }
 
