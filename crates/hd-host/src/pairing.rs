@@ -244,9 +244,8 @@ fn parse_device_session_body(text: &str) -> Result<SessionGrant, PairingError> {
         .map_err(|e| PairingError::BadResponse(format!("JSON 解析失败：{e}")))?;
     // 续期接口的 200 响应**必须**带 token：没有 token 的续期等于什么都没换到，
     // 此时按 BadResponse 上报，让调用方走「清会话、提示重新配对」的兜底路径。
-    parse_session_grant(parsed.user_token, parsed.user, parsed.session_ttl_s).ok_or_else(|| {
-        PairingError::BadResponse("续期响应缺少 user_token（无法建立会话）".into())
-    })
+    parse_session_grant(parsed.user_token, parsed.user, parsed.session_ttl_s)
+        .ok_or_else(|| PairingError::BadResponse("续期响应缺少 user_token（无法建立会话）".into()))
 }
 
 /// 允许多次 `pair()` 调用共享的会话授权解析逻辑（纯函数，可穷举单测）。
@@ -285,7 +284,9 @@ pub fn parse_session_grant(
 
     // 🔴 服务端就绪后「全有」是常态；此处仅为防御性降级（旧补丁版本可能只回 token）。
     if user.is_none() || ttl_s.is_none() {
-        tracing::warn!("配对响应的会话授权字段不完整（缺 user 或 session_ttl_s），按已有字段降级使用");
+        tracing::warn!(
+            "配对响应的会话授权字段不完整（缺 user 或 session_ttl_s），按已有字段降级使用"
+        );
     }
 
     let user = user.unwrap_or_default();
@@ -340,8 +341,12 @@ impl PairingClient {
             app_version,
             // 申报 `workspace.list`：桌面端已实现 fs.list（hd-core 的 ListDirsExecutor）。
             // 少申报会让前端把本机空间置灰，多申报会让用户点了必然失败。
+            //
+            // 🔴 能力名**必须**引用协议层唯一真相源，不许再手写字面量：本处与
+            // `hd-runner/src/capabilities.rs` 的 `hello`/`ping` 申报必须逐字一致，
+            // 两处各写一份字面量就是「申报了但派发不了」这类事故的直接来源。
             capabilities: vec![CapabilityInput {
-                name: "workspace.list",
+                name: hd_protocol::capability::WORKSPACE_LIST,
                 version: "1",
             }],
         };
@@ -607,10 +612,7 @@ impl PairingClient {
     ///
     /// 之所以不解析响应体：这里只关心"是否还认这条会话"，用户资料在续期响应里
     /// 已经有了。多解析一层就多一处能因字段改名而误判的地方。
-    pub async fn check_user_session(
-        &self,
-        user_token: &UserToken,
-    ) -> Result<bool, PairingError> {
+    pub async fn check_user_session(&self, user_token: &UserToken) -> Result<bool, PairingError> {
         let url = format!("{}/api/v1/auth/me", self.base_url);
 
         let resp = self
@@ -626,8 +628,7 @@ impl PairingClient {
             return Ok(true);
         }
         // 401/403 是服务端对"这条会话不认"的明确表态。
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             // 丢弃 body 前先读掉，避免连接池里留下未消费的响应。
             let _ = resp.text().await;
             tracing::info!(
@@ -1039,8 +1040,8 @@ mod tests {
     /// 只缺展示字段时仍保留免登录（纯装饰字段缺失不该逼用户手动登录）。
     #[test]
     fn missing_display_fields_keep_session_usable() {
-        let grant = parse_session_grant(Some("hgt_only_token".into()), None, None)
-            .expect("有令牌即免登录");
+        let grant =
+            parse_session_grant(Some("hgt_only_token".into()), None, None).expect("有令牌即免登录");
         assert_eq!(grant.token.expose(), "hgt_only_token");
         assert_eq!(grant.ttl_s, None);
         // 无展示名时给中性占位，不 panic。
@@ -1116,8 +1117,8 @@ mod tests {
     /// 与配对响应保持同一套分级宽容策略，避免「配对能降级、续期直接失败」的口径分裂。
     #[test]
     fn device_session_response_with_only_token_still_usable() {
-        let grant = parse_device_session_body(r#"{"user_token":"hgt_only"}"#)
-            .expect("有令牌即应可续期");
+        let grant =
+            parse_device_session_body(r#"{"user_token":"hgt_only"}"#).expect("有令牌即应可续期");
         assert_eq!(grant.token.expose(), "hgt_only");
         assert_eq!(grant.ttl_s, None);
         assert_eq!(grant.user.label(), "该账号");
@@ -1164,7 +1165,10 @@ mod tests {
     fn error_body_keeps_revoked_code_without_token() {
         let err = parse_error_body(401, r#"{"code":"device.token_revoked"}"#);
         let shown = err.to_string();
-        assert!(shown.contains("device.token_revoked"), "应保留错误码：{shown}");
+        assert!(
+            shown.contains("device.token_revoked"),
+            "应保留错误码：{shown}"
+        );
         assert!(!shown.contains("hgt_"), "错误文案不得含令牌痕迹：{shown}");
     }
 
