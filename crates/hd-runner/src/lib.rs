@@ -1,8 +1,18 @@
 //! harness_desktop 执行引擎 Runner。
 //!
-//! 当前阶段（P2）已实现：WS 连接、`welcome` 握手、心跳节奏驱动、重连决策。
-//! 尚未实现（P3+）：任务派发路由、执行器、安全闸门 —— 见
-//! `docs/桌面端架构与功能设计.md` §19。
+//! ## 已实现范围（截至 `fcf9dbe` 接通 fs.list 端到端）
+//!
+//! - **连接面**：`transport`（WS 连接 / Session）、`ipc`（stdio 首行 auth 控制面）；
+//! - **节奏面**：`heartbeat`（间隔必须来自 `welcome`）、`reconnect`（退避决策）；
+//! - **执行面**：`supervisor`（守护主循环 / 派发编排 / 并发上限）、`router`
+//!   （`task.dispatch` → `Guarded<E>` 执行 → `task.result`）、`idempot`（TTL 幂等回放）、
+//!   `frames::fs_list`（`fs.list` 帧编解）、`capabilities`（能力申报，派生自
+//!   [`Router::tool_names`]，不维护手写常量数组）。
+//!
+//! 🔴 **执行器与安全闸门不在本 crate**：`Guarded` / `Policy` / `ListDirsExecutor` 全部由
+//! `hd-core` 实现，本 crate 只**接入**（`router.rs` 的 `ToolTable` 里只可能存在
+//! `Guarded<E>`，见该文件头 §16.2 的类型级保证）。设计依据见
+//! `docs/桌面端架构与功能设计.md` §16.2 / §19。
 //!
 //! ## 分层原则
 //!
